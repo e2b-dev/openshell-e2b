@@ -1,5 +1,4 @@
 // Upload a local file into a sandbox: tsx scripts/upload.ts <id> <local> <remote>
-import 'dotenv/config'
 import { readFile } from 'node:fs/promises'
 import { Sandbox } from 'e2b'
 const [id, local, remote] = process.argv.slice(2)

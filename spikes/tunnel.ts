@@ -8,10 +8,10 @@
 //
 // The sandbox is private (allowPublicTraffic: false), wstunnel forwards only to
 // 127.0.0.1:7000 (an echo service), and the sandbox is killed at the end.
-import 'dotenv/config'
 import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { connect } from 'node:net'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { Sandbox } from 'e2b'
 
 const WSTUNNEL = 'https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz'
@@ -58,7 +58,7 @@ async function main() {
       `--restrict-http-upgrade-path-prefix ${pathSecret} > /tmp/wst.log 2>&1`,
       { background: true },
     )
-    await new Promise((r) => setTimeout(r, 1500))
+    await sleep(1500)
     const host = sbx.getHost(PORT)
 
     // 1. no token: E2B's proxy must refuse
@@ -77,7 +77,7 @@ async function main() {
       if (CLIENT_LOG) import('node:fs').then((fs) => fs.appendFileSync(CLIENT_LOG, d))
       if (/error|denied|failed|close/i.test(String(d))) log('client:', String(d).trim().slice(0, 300))
     })
-    await new Promise((r) => setTimeout(r, 1500))
+    await sleep(1500)
 
     const small = await echoRoundTrip(Buffer.from('hello from openshell-e2b'))
     log('2. token + path    ->', small.ok ? 'ECHO OK' : 'FAILED', `${small.ms} ms`)
@@ -92,7 +92,7 @@ async function main() {
       '-H', `e2b-traffic-access-token: ${sbx.trafficAccessToken}`,
       `wss://${host}`,
     ], { stdio: 'ignore' })
-    await new Promise((r) => setTimeout(r, 1500))
+    await sleep(1500)
     const wrong = await echoRoundTrip(Buffer.from('should not arrive'), LOCAL + 1)
     log('3. token, bad path ->', wrong.ok ? 'ECHO WORKED (bad)' : 'REJECTED (good)')
     badClient.kill()

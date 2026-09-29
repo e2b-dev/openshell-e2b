@@ -1,5 +1,4 @@
 // openshell-builder: 8 vCPU / 8 GB box with Rust 1.95 for building OpenShell (+ our E2B driver).
-import 'dotenv/config'
 import { Template, defaultBuildLogger } from 'e2b'
 
 export const template = Template()

@@ -1,8 +1,8 @@
-//! openshell-driver-e2b: an external OpenShell compute driver backed by E2B sandboxes.
+//! openshell-driver-e2b: an external `OpenShell` compute driver backed by E2B sandboxes.
 //!
 //! HOW IT FITS
 //! -----------
-//! OpenShell's gateway is the "boss": it owns users, policies and sandbox
+//! `OpenShell`'s gateway is the "boss": it owns users, policies and sandbox
 //! records, but it cannot create machines by itself. For that it talks to a
 //! *compute driver*. NVIDIA ships drivers for Docker, Podman, Kubernetes and
 //! VMs. This program is a driver for E2B.
@@ -43,7 +43,11 @@ struct Args {
     bind_socket: PathBuf,
 
     /// E2B template used for workload (agent) sandboxes.
-    #[arg(long, env = "OPENSHELL_E2B_TEMPLATE", default_value = "openshell-workload")]
+    #[arg(
+        long,
+        env = "OPENSHELL_E2B_TEMPLATE",
+        default_value = "openshell-workload"
+    )]
     template: String,
 
     /// Tags every E2B box we create, so several control planes can share a team.
@@ -63,7 +67,11 @@ struct Args {
     wstunnel: PathBuf,
 
     /// How supervisors reach the gateway, and the client certificate they use.
-    #[arg(long, env = "OPENSHELL_E2B_GATEWAY", default_value = "https://127.0.0.1:17670")]
+    #[arg(
+        long,
+        env = "OPENSHELL_E2B_GATEWAY",
+        default_value = "https://127.0.0.1:17670"
+    )]
     gateway_endpoint: String,
     #[arg(long, env = "OPENSHELL_E2B_GATEWAY_CA")]
     gateway_ca: PathBuf,
@@ -73,7 +81,11 @@ struct Args {
     gateway_key: PathBuf,
 
     /// Per-sandbox local state (supervisor papers, logs).
-    #[arg(long, env = "OPENSHELL_E2B_STATE_DIR", default_value = "/tmp/openshell-e2b")]
+    #[arg(
+        long,
+        env = "OPENSHELL_E2B_STATE_DIR",
+        default_value = "/tmp/openshell-e2b"
+    )]
     state_dir: PathBuf,
 
     #[arg(long, env = "OPENSHELL_E2B_LOG", default_value = "info")]
@@ -100,7 +112,10 @@ async fn main() -> Result<()> {
     // Runs until Ctrl-C / SIGINT.
     let config = lifecycle::Config {
         template: args.template,
-        e2b: e2b::E2b { node: args.node, helper: args.helper },
+        e2b: e2b::E2b {
+            node: args.node,
+            helper: args.helper,
+        },
         supervisor_bin: args.supervisor,
         wstunnel_bin: args.wstunnel,
         gateway_endpoint: args.gateway_endpoint,

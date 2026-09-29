@@ -3,7 +3,6 @@
 //   tsx scripts/sbx.ts exec <id> <command...>         -> runs as user, streams output
 //   tsx scripts/sbx.ts kill <id>
 //   tsx scripts/sbx.ts ls
-import 'dotenv/config'
 import { Sandbox, CommandExitError } from 'e2b'
 
 const [cmd, ...rest] = process.argv.slice(2)

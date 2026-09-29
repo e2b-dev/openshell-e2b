@@ -2,7 +2,7 @@
 //!
 //! CREATE, step by step (numbers match the comments below):
 //!
-//!   gateway ── CreateSandbox(spec + launch_authentication) ──► driver
+//!   gateway ── CreateSandbox(spec + `launch_authentication`) ──► driver
 //!     1  decode the gateway's signed launch authentication
 //!     2  create a private E2B box from the openshell-workload template
 //!     3  build the fence (netns with only loopback) and check it
@@ -24,15 +24,15 @@ use crate::boundary::{self, E2bBoundarySpec};
 use crate::e2b::E2b;
 use openshell_core::jwt::SandboxLaunchAuthentication;
 use openshell_core::proto::compute::v1::{DriverCondition, DriverSandbox, DriverSandboxStatus};
+use openshell_core::sandbox_env as env;
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, generate_sandbox_tls_material,
 };
-use openshell_core::sandbox_env as env;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
@@ -58,7 +58,7 @@ pub struct Config {
     pub owner: String,
 }
 
-/// A running sandbox: its OpenShell record plus the local helper processes.
+/// A running sandbox: its `OpenShell` record plus the local helper processes.
 pub struct Running {
     pub sandbox: DriverSandbox,
     pub e2b_id: String,
@@ -88,18 +88,28 @@ fn free_local_port() -> std::io::Result<SocketAddr> {
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    buf.iter()
+        .fold(String::with_capacity(bytes * 2), |mut hex, b| {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
 }
 
-async fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
+async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let shown = path.display().to_string();
-    let path = path.clone();
+    let path = path.to_path_buf();
     let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
         // 0600 from the moment the file exists: no window where others can read it.
-        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
         f.write_all(&bytes)
     })
     .await
@@ -112,9 +122,10 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, St
 
     // 1. The gateway's launch authentication: JWTs for the supervisor, and the
     //    session id + gateway public keys for the sandbox.
-    let auth: SandboxLaunchAuthentication =
-        serde_json::from_slice(&spec.launch_authentication).map_err(|e| format!("decode launch authentication: {e}"))?;
-    auth.validate().map_err(|e| format!("validate launch authentication: {e}"))?;
+    let auth: SandboxLaunchAuthentication = serde_json::from_slice(&spec.launch_authentication)
+        .map_err(|e| format!("decode launch authentication: {e}"))?;
+    auth.validate()
+        .map_err(|e| format!("validate launch authentication: {e}"))?;
     let session_id = auth.supervisor.session_id;
     let generation = auth.supervisor.runtime_generation.to_string();
 
@@ -133,7 +144,12 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, St
     match provision_and_start(cfg, sandbox, &auth, session_id, &generation, &boxed).await {
         Ok(children) => Ok(Running {
             sandbox: DriverSandbox {
-                status: Some(status("OpenShell runtime and supervisor started", true, &e2b_id, "BackendReady")),
+                status: Some(status(
+                    "OpenShell runtime and supervisor started",
+                    true,
+                    &e2b_id,
+                    "BackendReady",
+                )),
                 ..sandbox.clone()
             },
             e2b_id,
@@ -163,9 +179,15 @@ async fn provision_and_start(
         .e2b
         .run_ok(e2b_id, "ip netns add os 2>/dev/null; ip -n os link set lo up && ip -n os -o link show | awk -F': ' '{print $2}'", "root")
         .await?;
-    let fenced_interfaces: Vec<String> = fence.stdout.split_whitespace().map(str::to_string).collect();
+    let fenced_interfaces: Vec<String> = fence
+        .stdout
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
     if fenced_interfaces != ["lo"] {
-        return Err(format!("fence check failed: interfaces {fenced_interfaces:?}"));
+        return Err(format!(
+            "fence check failed: interfaces {fenced_interfaces:?}"
+        ));
     }
 
     // 4. This session's TLS identity + both papers, via NVIDIA's functions.
@@ -176,7 +198,8 @@ async fn provision_and_start(
         .map(|k| {
             Ok(GatewayVerificationKey {
                 key_id: k.key_id.clone(),
-                public_key_pem: String::from_utf8(k.public_key_pem.clone()).map_err(|e| e.to_string())?,
+                public_key_pem: String::from_utf8(k.public_key_pem.clone())
+                    .map_err(|e| e.to_string())?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -215,16 +238,31 @@ async fn provision_and_start(
     let bootstrap = papers.boundary_config.encode().map_err(|e| e.to_string())?;
     for (path, bytes) in [
         (boundary::BOOTSTRAP_PATH, bootstrap.as_slice()),
-        (boundary::SERVER_CERT_PATH, tls.certificate_chain_pem.as_bytes()),
+        (
+            boundary::SERVER_CERT_PATH,
+            tls.certificate_chain_pem.as_bytes(),
+        ),
         (boundary::SERVER_KEY_PATH, tls.private_key_pem.as_bytes()),
     ] {
-        cfg.e2b.write(e2b_id, path, bytes, "root", Some(0o600)).await?;
+        cfg.e2b
+            .write(e2b_id, path, bytes, "root", Some(0o600))
+            .await?;
     }
-    cfg.e2b.run_ok(e2b_id, "chown 1500:1500 /.openshell/channel/sandbox/*", "root").await?;
+    cfg.e2b
+        .run_ok(
+            e2b_id,
+            "chown 1500:1500 /.openshell/channel/sandbox/*",
+            "root",
+        )
+        .await?;
 
     // 6. Start OpenShell's runtime inside the fence (see launch-sandbox.sh).
     cfg.e2b
-        .run_background(e2b_id, "exec /opt/openshell/launch-sandbox.sh > /tmp/openshell-sandbox.log 2>&1", "root")
+        .run_background(
+            e2b_id,
+            "exec /opt/openshell/launch-sandbox.sh > /tmp/openshell-sandbox.log 2>&1",
+            "root",
+        )
         .await?;
 
     // 7. Tunnel 2, server side. socat turns the Unix socket into a local TCP
@@ -254,8 +292,13 @@ async fn provision_and_start(
 
     // Local state for this sandbox: supervisor papers (0600) and sockets.
     let dir = cfg.state_dir.join(&sandbox.id);
-    tokio::fs::create_dir_all(dir.join("proxy-tls")).await.map_err(|e| e.to_string())?;
-    let descriptor = papers.runtime_descriptor.backend_descriptor().map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(dir.join("proxy-tls"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let descriptor = papers
+        .runtime_descriptor
+        .backend_descriptor()
+        .map_err(|e| e.to_string())?;
     let descriptor_path = dir.join("runtime-descriptor.json");
     write_private(&descriptor_path, &descriptor.payload).await?;
     let auth_path = dir.join("auth.json");
@@ -285,27 +328,30 @@ async fn provision_and_start(
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     // 9. NVIDIA's supervisor: policy engine + egress proxy for this sandbox.
-    let main_process_spec = env::MainProcessConfig::encode_driver_spec(Some(spec_of(sandbox)))
+    let main_process_spec = env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
         .map_err(|e| e.to_string())?;
     let supervisor = Command::new(&cfg.supervisor_bin)
-        .args([
-            "--backend-descriptor-file",
-            descriptor_path.to_str().unwrap(),
-            "--auth-bundle-file",
-            auth_path.to_str().unwrap(),
-            "--workdir",
-            "/sandbox",
-        ])
+        .arg("--backend-descriptor-file")
+        .arg(&descriptor_path)
+        .arg("--auth-bundle-file")
+        .arg(&auth_path)
+        .args(["--workdir", "/sandbox"])
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env(env::ADMITTED_ISOLATION_BACKEND, openshell_sandbox_backend::BACKEND_NAME)
+        .env(
+            env::ADMITTED_ISOLATION_BACKEND,
+            openshell_sandbox_backend::BACKEND_NAME,
+        )
         .env(env::MAIN_PROCESS_SPEC, main_process_spec)
         .env(env::ENDPOINT, &cfg.gateway_endpoint)
         .env(env::SANDBOX_ID, &sandbox.id)
         .env(env::SANDBOX, &sandbox.name)
         .env(env::SSH_SOCKET_PATH, dir.join("ssh.sock"))
         .env(env::PROXY_TLS_DIR, dir.join("proxy-tls"))
-        .env(env::NETWORK_RUNTIME_CAPABILITIES, env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY)
+        .env(
+            env::NETWORK_RUNTIME_CAPABILITIES,
+            env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY,
+        )
         .env(env::LOG_LEVEL, "info")
         .env(env::TELEMETRY_ENABLED, "false")
         .env(env::TLS_CA, &cfg.gateway_ca)
@@ -321,11 +367,7 @@ async fn provision_and_start(
     Ok(vec![wstunnel, supervisor])
 }
 
-fn spec_of(sandbox: &DriverSandbox) -> &openshell_core::proto::compute::v1::DriverSandboxSpec {
-    sandbox.spec.as_ref().expect("checked in create")
-}
-
-/// User environment for the agent, minus names OpenShell reserves for itself
+/// User environment for the agent, minus names `OpenShell` reserves for itself
 /// (same protected list as NVIDIA's Docker driver).
 fn child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> {
     let mut vars = sandbox
@@ -342,7 +384,7 @@ fn child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> {
 }
 
 pub async fn delete(cfg: &Config, mut running: Running) {
-    for child in running.children.iter_mut() {
+    for child in &mut running.children {
         let _ = child.kill().await;
     }
     if let Err(e) = cfg.e2b.kill(&running.e2b_id).await {

@@ -36,7 +36,7 @@ pub const SERVER_CERT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 pub const SERVER_KEY_PATH: &str = "/.openshell/channel/sandbox/server.key";
 
 /// What we observed about the fence, fingerprinted into the papers.
-/// launch-sandbox.sh refuses to start unless `fenced_interfaces` is exactly ["lo"].
+/// `launch-sandbox.sh` refuses to start unless `fenced_interfaces` is exactly `["lo"]`.
 #[derive(Serialize)]
 struct E2bOuterFenceEvidence<'a> {
     e2b_sandbox_id: &'a str,
@@ -46,11 +46,13 @@ struct E2bOuterFenceEvidence<'a> {
 }
 
 impl E2bOuterFenceEvidence<'_> {
-    /// Turn observed facts into OpenShell's four fence guarantees. Each
+    /// Turn observed facts into `OpenShell`'s four fence guarantees. Each
     /// guarantee is only claimed if the matching fact holds.
     fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
         if self.e2b_sandbox_id.is_empty() {
-            return Err(BackendError::Descriptor("E2B fence evidence is incomplete".into()));
+            return Err(BackendError::Descriptor(
+                "E2B fence evidence is incomplete".into(),
+            ));
         }
         let mut established = Vec::new();
         if self.fenced_interfaces == ["lo".to_string()] {
@@ -65,7 +67,8 @@ impl E2bOuterFenceEvidence<'_> {
         }
         let encoded = serde_json::to_vec(self)
             .map_err(|e| BackendError::Descriptor(format!("encode E2B fence evidence: {e}")))?;
-        let projection = OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)?;
+        let projection =
+            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)?;
         projection.validate(generation)?;
         Ok(projection)
     }

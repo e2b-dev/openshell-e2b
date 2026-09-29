@@ -8,7 +8,6 @@
 //   /.openshell/channel/sandbox        where the driver writes this session's papers
 //
 // Build after scripts/build-binaries.ts:  npx tsx templates/workload.ts
-import 'dotenv/config'
 import { Template, defaultBuildLogger } from 'e2b'
 
 const TAG = process.env.OPENSHELL_TAG ?? 'v0.1.2'

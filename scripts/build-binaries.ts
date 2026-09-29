@@ -3,7 +3,6 @@
 // Clones NVIDIA/OpenShell at OPENSHELL_TAG, applies patches/landlock-abi2.patch,
 // builds openshell-sandbox and openshell-supervisor in release mode, and
 // downloads them to dist/<tag>/.
-import 'dotenv/config'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { Sandbox } from 'e2b'
 

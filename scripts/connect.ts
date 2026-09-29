@@ -15,10 +15,10 @@
 //
 // Usage: tsx scripts/connect.ts <control-sandbox-id>
 // Keeps running (it holds the tunnel open). Ctrl-C to stop.
-import 'dotenv/config'
 import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { mkdir, writeFile, chmod } from 'node:fs/promises'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { Sandbox } from 'e2b'
 
 const GATEWAY_PORT = 17670 // gateway inside the sandbox (localhost only)
@@ -36,7 +36,7 @@ async function main() {
   const token = sbx.trafficAccessToken
   if (!token) throw new Error('sandbox is public; control sandboxes must be private')
 
-  // Step 1: start the gateway (if not running) behind a locked-down wstunnel.
+  // Start the gateway (if not running) behind a locked-down wstunnel.
   // A fresh random path per connect; the old wstunnel is replaced.
   const pathSecret = randomBytes(16).toString('hex')
   await sbx.commands.run(
@@ -62,7 +62,7 @@ async function main() {
       timeoutMs: 0,
     })
     await handle.disconnect()
-    await new Promise((r) => setTimeout(r, 1000))
+    await sleep(1000)
     log(`${name}: started`)
   }
   // The driver reads the E2B API key from a 0600 file in the control box only.
@@ -99,7 +99,7 @@ async function main() {
     `./wstunnel server ws://0.0.0.0:${TUNNEL_PORT} --restrict-to 127.0.0.1:${GATEWAY_PORT} ` +
     `--restrict-http-upgrade-path-prefix ${pathSecret}`, true)
 
-  // Step 2: copy the CLI's client certificate out of the sandbox.
+  // Copy the CLI's client certificate out of the sandbox.
   // These files ARE the login: whoever holds tls.key can talk to the gateway.
   const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`
   await mkdir(mtls, { recursive: true, mode: 0o700 })
@@ -109,7 +109,7 @@ async function main() {
   }
   log('client certificate saved to', mtls)
 
-  // Step 3: open the tunnel on the laptop. 10 s heartbeat: spike A showed
+  // Open the tunnel on the laptop. 10 s heartbeat: spike A showed
   // E2B's proxy drops connections that stay silent for about a minute.
   const client = spawn(`${process.cwd()}/.bin/wstunnel`, [
     'client', '-L', `tcp://127.0.0.1:${LOCAL_PORT}:127.0.0.1:${GATEWAY_PORT}`,
