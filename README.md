@@ -9,12 +9,19 @@ An external [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) compute driv
 Recorded with [VHS](https://github.com/charmbracelet/vhs) from `media/demo.tape` against a live E2B control plane (`vhs media/demo.tape`).
 
 ```
-laptop                         E2B control box (private)                       E2B agent box (private, one per sandbox)
-openshell CLI ══ tunnel 1 ══►  openshell-gateway (NVIDIA)                       ┌ netns: loopback only ─────────────────┐
-  (mTLS inside)                  ↕ unix socket                                  │ openshell-sandbox (NVIDIA, patched)    │
-                               openshell-driver-e2b (this repo) ── E2B API ───► │   uid 1500, 0 capabilities, no_new_privs│
-                               openshell-supervisor (NVIDIA, patched) ═ tunnel 2 ═► │   └ the agent                         │
-                                 policy engine + egress proxy → internet        └────────────────────────────────────────┘
+laptop                     E2B control box                       E2B agent box
+                           (private)                             (private, per sandbox)
+┌───────────────┐ tunnel 1 ┌──────────────────────────┐          ┌──────────────────────┐
+│ openshell CLI │═════════►│ openshell-gateway        │          │ netns: loopback only │
+└───────────────┘  (mTLS)  │   (NVIDIA)               │          │ openshell-sandbox    │
+                           │   ↕ unix socket          │          │   (NVIDIA, patched)  │
+                           │ openshell-driver-e2b     │          │   uid 1500, 0 caps,  │
+                           │   (this repo) ─► E2B API │ tunnel 2 │   no_new_privs       │
+                           │ openshell-supervisor     │═════════►│   └ the agent        │
+                           │   (NVIDIA, patched)      │          └──────────────────────┘
+                           │   policy + egress proxy  │
+                           │   ─► internet            │
+                           └──────────────────────────┘
 ```
 
 - **Tunnels** go through E2B's HTTPS port address: E2B traffic token + random secret path + E2B certificate verification + OpenShell TLS inside, with a 10 s heartbeat.
