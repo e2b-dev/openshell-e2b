@@ -4,6 +4,10 @@ An external [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) compute driv
 
 **Status: working demo, not production.** See [Limits](#limits).
 
+![demo](media/demo.gif)
+
+Recorded with [VHS](https://github.com/charmbracelet/vhs) from `media/demo.tape` against a live E2B control plane (`vhs media/demo.tape`).
+
 ```
 laptop                         E2B control box (private)                       E2B agent box (private, one per sandbox)
 openshell CLI ══ tunnel 1 ══►  openshell-gateway (NVIDIA)                       ┌ netns: loopback only ─────────────────┐
@@ -47,6 +51,8 @@ npm run template:control     # control box template
 | `patches/landlock-abi2.patch` | **Demo-only** patch, see below |
 | `scripts/connect.ts` | One-command control plane + CLI tunnel |
 | `scripts/demo.sh` | The demo |
+| `scripts/watch.ts` | `npm run watch`: live, color-coded control-plane log (driver, gateway, supervisors) |
+| `media/demo.tape` | VHS script for the recording |
 
 ## Limits
 
