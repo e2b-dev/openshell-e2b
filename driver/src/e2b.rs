@@ -127,6 +127,26 @@ impl E2b {
         Ok(())
     }
 
+    /// Ids of the running boxes this driver instance owns (by metadata tag).
+    pub async fn list_ids(&self, owner: &str) -> Result<std::collections::HashSet<String>, String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Item {
+            sandbox_id: String,
+        }
+        #[derive(Deserialize)]
+        struct Listed {
+            sandboxes: Vec<Item>,
+        }
+        let listed: Listed = self
+            .call(
+                "list",
+                json!({ "metadata": { "openshell.ai/driver-owner": owner } }),
+            )
+            .await?;
+        Ok(listed.sandboxes.into_iter().map(|i| i.sandbox_id).collect())
+    }
+
     pub async fn kill(&self, id: &str) -> Result<(), String> {
         let _: Value = self.call("kill", json!({ "sandboxId": id })).await?;
         Ok(())

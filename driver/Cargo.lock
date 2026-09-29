@@ -1308,6 +1308,7 @@ dependencies = [
  "base64",
  "clap",
  "futures",
+ "libc",
  "miette",
  "openshell-core",
  "openshell-isolation-interface",

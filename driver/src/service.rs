@@ -55,9 +55,11 @@ pub struct E2bDriver {
 impl E2bDriver {
     pub fn new(cfg: Config) -> Self {
         let (events, _) = broadcast::channel(256);
+        let sandboxes: Arc<Mutex<HashMap<String, Running>>> = Arc::default();
+        crate::health::spawn(cfg.clone(), sandboxes.clone(), events.clone());
         Self {
             cfg,
-            sandboxes: Arc::default(),
+            sandboxes,
             events,
         }
     }

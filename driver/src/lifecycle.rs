@@ -65,6 +65,22 @@ pub struct Running {
     pub children: Vec<Child>,
 }
 
+/// Flip Ready to False with a reason. Returns true if anything changed, so the
+/// caller only announces real transitions (not the same problem every 5 s).
+pub fn mark_not_ready(running: &mut Running, reason: &str, message: &str) -> bool {
+    let already = running
+        .sandbox
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
+        .is_some_and(|c| c.status == "False" && c.reason == reason);
+    if already {
+        return false;
+    }
+    running.sandbox.status = Some(status(message, false, &running.e2b_id, reason));
+    true
+}
+
 fn status(message: &str, ready: bool, e2b_id: &str, reason: &str) -> DriverSandboxStatus {
     DriverSandboxStatus {
         name: e2b_id.to_string(),
@@ -96,6 +112,44 @@ fn random_hex(bytes: usize) -> String {
         })
 }
 
+/// Create a 0700 directory, or accept an existing one only if it is a real
+/// directory (not a symlink) owned by us and closed to group/others.
+pub fn private_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let me = unsafe { libc::geteuid() };
+            if !meta.file_type().is_dir() {
+                return Err(format!(
+                    "{} exists and is not a directory (symlink?)",
+                    path.display()
+                ));
+            }
+            if meta.uid() != me {
+                return Err(format!(
+                    "{} is owned by uid {}, not us ({me})",
+                    path.display(),
+                    meta.uid()
+                ));
+            }
+            if meta.mode() & 0o077 != 0 {
+                return Err(format!(
+                    "{} is accessible to other users (mode {:o})",
+                    path.display(),
+                    meta.mode() & 0o777
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|e| format!("create {}: {e}", path.display())),
+        Err(e) => Err(format!("inspect {}: {e}", path.display())),
+    }
+}
+
 async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let shown = path.display().to_string();
@@ -103,13 +157,17 @@ async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
-        // 0600 from the moment the file exists: no window where others can read it.
+        // 0600 from the moment the file exists, and never follow a symlink
+        // someone planted where a secret should go (O_NOFOLLOW).
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?;
+        // An existing file keeps its old mode on open; force 0600 either way.
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         f.write_all(&bytes)
     })
     .await
@@ -295,9 +353,8 @@ async fn provision_and_start(
 
     // Local state for this sandbox: supervisor papers (0600) and sockets.
     let dir = cfg.state_dir.join(&sandbox.id);
-    tokio::fs::create_dir_all(dir.join("proxy-tls"))
-        .await
-        .map_err(|e| e.to_string())?;
+    private_dir(&dir)?;
+    private_dir(&dir.join("proxy-tls"))?;
     let descriptor = papers
         .runtime_descriptor
         .backend_descriptor()
@@ -418,4 +475,46 @@ pub fn check_supported(cfg: &Config, sandbox: &DriverSandbox) -> Result<(), Stri
         return Err("user namespaces are not supported by the e2b driver".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::private_dir;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("osd-e2b-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        dir
+    }
+
+    #[test]
+    fn creates_new_dir_as_0700() {
+        let dir = scratch("new");
+        assert!(private_dir(&dir).is_ok());
+        assert_eq!(std::fs::metadata(&dir).map(|m| m.mode() & 0o777).ok(), Some(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_dir_open_to_others() {
+        let dir = scratch("open");
+        std::fs::create_dir(&dir).ok();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+        assert!(private_dir(&dir).is_err_and(|e| e.contains("accessible to other users")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_symlink() {
+        let target = scratch("target");
+        let link = scratch("link");
+        std::fs::create_dir(&target).ok();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).ok();
+        std::os::unix::fs::symlink(&target, &link).ok();
+        assert!(private_dir(&link).is_err_and(|e| e.contains("not a directory")));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&target);
+    }
 }

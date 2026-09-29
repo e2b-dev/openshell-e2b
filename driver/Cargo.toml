@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 rand = "0.9"
+libc = "0.2"
 
 # Strict lints, enforced on every build. Crashing (unwrap/expect) is not
 # allowed in the driver: every failure must become an error the gateway sees.

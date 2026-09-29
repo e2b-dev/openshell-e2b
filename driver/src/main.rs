@@ -23,6 +23,7 @@
 
 mod boundary;
 mod e2b;
+mod health;
 mod lifecycle;
 mod service;
 
@@ -103,6 +104,8 @@ async fn main() -> Result<()> {
 
     // Create the private socket file. `SocketCleanup` deletes it again when
     // the program exits, so a restart doesn't fail on "address in use".
+    // Refuse to start on a state directory another user could tamper with.
+    lifecycle::private_dir(&args.state_dir).map_err(|e| miette::miette!(e))?;
     let listener = bind_private(&args.bind_socket).map_err(|e| miette::miette!(e))?;
     let _cleanup = SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), template = %args.template, owner = %args.owner, "starting E2B compute driver");
