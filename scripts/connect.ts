@@ -66,17 +66,23 @@ async function main() {
   const token = sbx.trafficAccessToken
   if (!token) throw new Error('control box is public; it must be private')
 
-  // One-time setup per box: PKI (CA, server + client certs, JWT signing key),
-  // gateway config, and the E2B API key for the driver (0600, this box only).
-  const initialised = (await sbx.commands.run(`test -f ${STATE}/pki/ca.crt && echo yes || echo no`)).stdout.trim() === 'yes'
-  if (!initialised) {
+  // One-time setup per box, each piece checked on its own so a half-finished
+  // earlier run is completed rather than skipped: PKI (CA, server + client
+  // certs, JWT signing key), gateway config, and the E2B API key for the
+  // driver (0600, this box only).
+  const exists = async (path: string) =>
+    (await sbx.commands.run(`test -f ${path} && echo yes || echo no`)).stdout.trim() === 'yes'
+  await sbx.commands.run(`mkdir -p ${STATE}/run && chmod 700 ${STATE}`)
+  if (!(await exists(`${STATE}/pki/ca.crt`))) {
     await sbx.commands.run(
-      `mkdir -p ${STATE}/run && chmod 700 ${STATE} && ` +
       `${ROOT}/bin/openshell-gateway generate-certs --output-dir ${STATE}/pki --server-san localhost --server-san 127.0.0.1 > ${STATE}/certgen.log 2>&1`,
       { timeoutMs: 60_000 },
     )
-    // Gateway config. [gateway_jwt] lets the gateway mint launch credentials
-    // (without it CreateSandbox arrives with no launch_authentication).
+    log('control box: PKI generated')
+  }
+  if (!(await exists(`${STATE}/gateway.toml`))) {
+    // [gateway_jwt] lets the gateway mint launch credentials (without it
+    // CreateSandbox arrives with no launch_authentication).
     // ttl_secs = 3600: sandbox tokens expire and get renewed, never "forever".
     await sbx.files.write(`${STATE}/gateway.toml`, [
       '[openshell]',
@@ -90,11 +96,14 @@ async function main() {
       'ttl_secs         = 3600',
       '',
     ].join('\n'))
+    log('control box: gateway config written')
+  }
+  if (!(await exists(`${STATE}/driver.env`))) {
     const key = (await readFile('.env', 'utf8')).split('\n').find((l) => l.startsWith('E2B_API_KEY='))
     if (!key) throw new Error('.env has no E2B_API_KEY')
     await sbx.files.write(`${STATE}/driver.env`, `${key}\n`)
     await sbx.commands.run(`chmod 600 ${STATE}/driver.env`)
-    log('control box initialised (PKI, gateway config, driver credentials)')
+    log('control box: driver credentials written')
   }
 
   // Long-running programs: each is its own E2B background command, tracked by
@@ -149,14 +158,13 @@ async function main() {
     await writeFile(`${mtls}/${local}`, await sbx.files.read(`${STATE}/${remote}`))
     await chmod(`${mtls}/${local}`, 0o600)
   }
-  // Register the gateway with the isolated CLI config (harmless if already there).
-  try {
-    execFileSync('.bin/openshell', ['gateway', 'add', '--local', '--name', GATEWAY_NAME, `https://127.0.0.1:${LOCAL_PORT}`], {
-      env: { ...process.env, XDG_CONFIG_HOME: CONFIG },
-      stdio: 'ignore',
-    })
-  } catch {
-    // Already registered, or the tunnel isn't up yet; the certificates are what matters.
+  // Register the gateway with the isolated CLI config, unless it already is.
+  const cli = (args: string[]) =>
+    execFileSync('.bin/openshell', args, { env: { ...process.env, XDG_CONFIG_HOME: CONFIG }, encoding: 'utf8' })
+  const registered = cli(['gateway', 'list']).split('\n').some((line) => line.replace('*', '').trim().startsWith(`${GATEWAY_NAME} `))
+  if (!registered) {
+    cli(['gateway', 'add', '--local', '--name', GATEWAY_NAME, `https://127.0.0.1:${LOCAL_PORT}`])
+    log(`CLI: registered gateway '${GATEWAY_NAME}'`)
   }
 
   // Open the tunnel on the laptop. 10 s heartbeat: spike A showed E2B's

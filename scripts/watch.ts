@@ -73,10 +73,12 @@ async function main() {
   // picked up as sandboxes appear; ones that already existed start from now,
   // new ones from their first line.
   // A per-run marker file, so a watcher left over from an earlier run can't
-  // claim this run's logs; `trap` stops this run's tails when the loop ends.
+  // claim this run's logs. The trap stops only this script's own tails.
+  // (Never `kill 0`: every E2B command shares envd's process group, so that
+  // would also kill envd, the gateway and the driver.)
   const run = `/tmp/watch-${process.pid}-${Date.now()}`
   const script = [
-    `cd ${STATE} && : > ${run} && trap 'kill 0' EXIT`,
+    `cd ${STATE} && : > ${run} && trap 'kill $(jobs -p) 2>/dev/null' EXIT`,
     `(tail -n 0 -F gateway.log | sed -u 's/^/gateway|/') &`,
     `(tail -n 0 -F driver.log | sed -u 's/^/driver|/') &`,
     'from=0',

@@ -23,10 +23,11 @@ openshell CLI ══ tunnel 1 ══►  openshell-gateway (NVIDIA)             
 
 ## Run the demo
 
-Needs `E2B_API_KEY` in `.env`, Node 22+, and the binaries in `.bin/` (`wstunnel`, `openshell` CLI for your OS).
+Needs `E2B_API_KEY` in `.env` and Node 22+.
 
 ```bash
 npm install
+npm run setup                # downloads the openshell CLI + wstunnel into .bin/
 npm run connect -- --new     # terminal 1: fresh control box + tunnel (~12 s); keep it running
 npm run demo                 # terminal 2: create → isolation → policy → GET 200 / POST 403 → audit → delete
 ```

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "setup": "scripts/setup-bin.sh",
     "template:builder": "tsx --env-file=.env templates/builder.ts",
     "template:workload": "tsx --env-file=.env templates/workload.ts",
     "build:binaries": "tsx --env-file=.env scripts/build-binaries.ts",
