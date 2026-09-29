@@ -99,9 +99,12 @@ async function main() {
     log('control box: gateway config written')
   }
   if (!(await exists(`${STATE}/driver.env`))) {
-    const key = (await readFile('.env', 'utf8')).split('\n').find((l) => l.startsWith('E2B_API_KEY='))
+    const lines = (await readFile('.env', 'utf8')).split('\n')
+    const key = lines.find((l) => l.startsWith('E2B_API_KEY='))
     if (!key) throw new Error('.env has no E2B_API_KEY')
-    await sbx.files.write(`${STATE}/driver.env`, `${key}\n`)
+    // E2B_DOMAIN (optional) points the driver at the same cluster as this laptop, e.g. EU.
+    const domain = lines.find((l) => l.startsWith('E2B_DOMAIN='))
+    await sbx.files.write(`${STATE}/driver.env`, [key, domain].filter(Boolean).join('\n') + '\n')
     await sbx.commands.run(`chmod 600 ${STATE}/driver.env`)
     log('control box: driver credentials written')
   }
@@ -150,14 +153,6 @@ async function main() {
     `--restrict-http-upgrade-path-prefix ${pathSecret}`,
     true)
 
-  // The CLI's client certificate. These files ARE the login: whoever holds
-  // tls.key can talk to the gateway.
-  const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`
-  await mkdir(mtls, { recursive: true, mode: 0o700 })
-  for (const [remote, local] of [['pki/ca.crt', 'ca.crt'], ['pki/client/tls.crt', 'tls.crt'], ['pki/client/tls.key', 'tls.key']]) {
-    await writeFile(`${mtls}/${local}`, await sbx.files.read(`${STATE}/${remote}`))
-    await chmod(`${mtls}/${local}`, 0o600)
-  }
   // Register the gateway with the isolated CLI config, unless it already is.
   const cli = (args: string[]) =>
     execFileSync('.bin/openshell', args, { env: { ...process.env, XDG_CONFIG_HOME: CONFIG }, encoding: 'utf8' })
@@ -165,6 +160,16 @@ async function main() {
   if (!registered) {
     cli(['gateway', 'add', '--local', '--name', GATEWAY_NAME, `https://127.0.0.1:${LOCAL_PORT}`])
     log(`CLI: registered gateway '${GATEWAY_NAME}'`)
+  }
+
+  // The CLI's client certificate. These files ARE the login: whoever holds
+  // tls.key can talk to the gateway. Written after `gateway add --local`,
+  // which copies in the certs of any local OpenShell gateway on this laptop.
+  const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`
+  await mkdir(mtls, { recursive: true, mode: 0o700 })
+  for (const [remote, local] of [['pki/ca.crt', 'ca.crt'], ['pki/client/tls.crt', 'tls.crt'], ['pki/client/tls.key', 'tls.key']]) {
+    await writeFile(`${mtls}/${local}`, await sbx.files.read(`${STATE}/${remote}`))
+    await chmod(`${mtls}/${local}`, 0o600)
   }
 
   // Open the tunnel on the laptop. 10 s heartbeat: spike A showed E2B's
