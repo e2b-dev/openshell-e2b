@@ -2,7 +2,7 @@
 //   tsx scripts/sbx.ts create [template] [minutes]   -> prints id (private sandbox)
 //   tsx scripts/sbx.ts exec <id> <command...>         -> runs as user, streams output
 //   tsx scripts/sbx.ts kill <id>
-//   tsx scripts/sbx.ts ls
+//   tsx scripts/sbx.ts ls                              -> id template state started [openshell name]
 import { Sandbox, CommandExitError } from 'e2b'
 
 const [cmd, ...rest] = process.argv.slice(2)
@@ -27,7 +27,7 @@ if (cmd === 'create') {
   console.log(await Sandbox.kill(rest[0]) ? `killed ${rest[0]}` : `not found ${rest[0]}`)
 } else if (cmd === 'ls') {
   const p = Sandbox.list()
-  for (const s of await p.nextItems()) console.log(s.sandboxId, s.templateId, s.state, s.startedAt.toISOString())
+  for (const s of await p.nextItems()) console.log(s.sandboxId, s.templateId, s.state, s.startedAt.toISOString(), s.metadata?.['openshell.ai/sandbox-name'] ?? '')
 } else {
   console.error('usage: sbx.ts create|exec|kill|ls'); process.exit(2)
 }
