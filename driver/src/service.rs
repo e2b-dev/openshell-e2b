@@ -4,15 +4,19 @@
 //! turns that file into a Rust trait (`ComputeDriver`), and we answer each
 //! question by implementing one method of it:
 //!
-//!   gateway asks                      we answer (today)
-//!   ──────────────────────────────    ─────────────────────────────────
-//!   GetCapabilities  "who are you?"   name, version, rules we accept  ✅
-//!   ListSandboxes / WatchSandboxes    "none yet" / quiet stream       ✅
-//!   Create / Start / Stop / Delete    "not implemented yet"           ⏳
+//!   gateway asks                      we answer
+//!   ──────────────────────────────    ─────────────────────────────────────────
+//!   GetCapabilities  "who are you?"   name, version, rules we accept        ✅
+//!   ValidateSandboxCreate             "fine"                                ✅
+//!   CreateSandbox                     E2B box + fence + runtime + supervisor ✅ (lifecycle.rs)
+//!   Get / List / WatchSandboxes       from our in-memory table              ✅
+//!   DeleteSandbox                     stop supervisor + tunnel, kill E2B box ✅
+//!   Stop / Start                      "not implemented yet"                 ⏳
 //!
-//! STATUS: skeleton. Enough for the gateway to start and accept CLI
-//! connections. Creating real E2B sandboxes comes next.
+//! State lives in memory. If the driver restarts, it forgets its sandboxes
+//! (the E2B boxes stay tagged with metadata, so they can be found and cleaned).
 
+use crate::lifecycle::{self, Config, Running};
 use futures::Stream;
 use openshell_core::extension_protocol::{ExtensionFamily, extension_metadata, validate_gateway_metadata};
 use openshell_core::proto::compute::v1::{
@@ -22,23 +26,34 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event::Payload,
 };
 use openshell_core::resource_admission::{DriverAdmissionConfig, ResourceAdmissionConfig};
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::{Mutex, broadcast};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
 pub const DRIVER_NAME: &str = "e2b";
 const IMPLEMENTATION: &str = "sudolabs/openshell-driver-e2b";
 
 pub struct E2bDriver {
-    template: String,
+    cfg: Config,
+    /// OpenShell sandbox id → running sandbox.
+    sandboxes: Arc<Mutex<HashMap<String, Running>>>,
+    /// Fan-out of changes to every open WatchSandboxes stream.
+    events: broadcast::Sender<WatchSandboxesEvent>,
 }
 
 impl E2bDriver {
-    pub fn new(template: String) -> Self {
-        Self { template }
+    pub fn new(cfg: Config) -> Self {
+        let (events, _) = broadcast::channel(256);
+        Self { cfg, sandboxes: Arc::default(), events }
     }
 
     /// The handshake answer. The gateway refuses to start until it gets this.
@@ -55,7 +70,7 @@ impl E2bDriver {
             .acknowledgement(),
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
-            default_image: self.template.clone(),
+            default_image: self.cfg.template.clone(),
             // The gateway decides when to create/stop/delete; we just do it.
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
@@ -75,13 +90,14 @@ impl E2bDriver {
             )),
         }
     }
+
+    fn announce(&self, payload: Payload) {
+        // No listeners is fine: the gateway may not be watching yet.
+        let _ = self.events.send(WatchSandboxesEvent { payload: Some(payload) });
+    }
 }
 
 type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
-
-fn todo<T>(what: &str) -> Result<Response<T>, Status> {
-    Err(Status::unimplemented(format!("e2b driver: {what} not implemented yet")))
-}
 
 #[tonic::async_trait]
 impl ComputeDriver for E2bDriver {
@@ -90,13 +106,8 @@ impl ComputeDriver for E2bDriver {
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let caps = self.capabilities();
-        validate_gateway_metadata(
-            ExtensionFamily::Compute,
-            DRIVER_NAME,
-            caps.extension.as_ref(),
-            request.into_inner().gateway,
-        )
-        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        validate_gateway_metadata(ExtensionFamily::Compute, DRIVER_NAME, caps.extension.as_ref(), request.into_inner().gateway)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
         Ok(Response::new(caps))
     }
 
@@ -109,59 +120,73 @@ impl ComputeDriver for E2bDriver {
 
     async fn validate_sandbox_create(
         &self,
-        _request: Request<ValidateSandboxCreateRequest>,
+        request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        todo("validate_sandbox_create")
+        request.into_inner().sandbox.ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+        Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
-    async fn get_sandbox(&self, _request: Request<GetSandboxRequest>) -> Result<Response<GetSandboxResponse>, Status> {
-        Err(Status::not_found("sandbox not found"))
+    async fn get_sandbox(&self, request: Request<GetSandboxRequest>) -> Result<Response<GetSandboxResponse>, Status> {
+        let id = request.into_inner().sandbox_id;
+        let table = self.sandboxes.lock().await;
+        let running = table.get(&id).ok_or_else(|| Status::not_found("sandbox not found"))?;
+        Ok(Response::new(GetSandboxResponse { sandbox: Some(running.sandbox.clone()) }))
     }
 
-    async fn list_sandboxes(
-        &self,
-        _request: Request<ListSandboxesRequest>,
-    ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Ok(Response::new(ListSandboxesResponse::default()))
+    async fn list_sandboxes(&self, _request: Request<ListSandboxesRequest>) -> Result<Response<ListSandboxesResponse>, Status> {
+        let table = self.sandboxes.lock().await;
+        Ok(Response::new(ListSandboxesResponse { sandboxes: table.values().map(|r| r.sandbox.clone()).collect() }))
     }
 
-    async fn create_sandbox(&self, _request: Request<CreateSandboxRequest>) -> Result<Response<CreateSandboxResponse>, Status> {
-        todo("create_sandbox")
+    async fn create_sandbox(&self, request: Request<CreateSandboxRequest>) -> Result<Response<CreateSandboxResponse>, Status> {
+        let sandbox = request.into_inner().sandbox.ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+        let running = lifecycle::create(&self.cfg, &sandbox).await.map_err(Status::internal)?;
+        let runtime_identity = running.e2b_id.clone();
+        self.announce(Payload::Sandbox(WatchSandboxesSandboxEvent { sandbox: Some(running.sandbox.clone()) }));
+        self.sandboxes.lock().await.insert(sandbox.id.clone(), running);
+        Ok(Response::new(CreateSandboxResponse { runtime_identity }))
     }
 
     async fn stop_sandbox(&self, _request: Request<StopSandboxRequest>) -> Result<Response<StopSandboxResponse>, Status> {
-        todo("stop_sandbox")
+        Err(Status::unimplemented("e2b driver: stop not implemented yet"))
     }
 
     async fn start_sandbox(&self, _request: Request<StartSandboxRequest>) -> Result<Response<StartSandboxResponse>, Status> {
-        todo("start_sandbox")
+        Err(Status::unimplemented("e2b driver: start not implemented yet"))
     }
 
-    async fn delete_sandbox(&self, _request: Request<DeleteSandboxRequest>) -> Result<Response<DeleteSandboxResponse>, Status> {
-        todo("delete_sandbox")
+    async fn delete_sandbox(&self, request: Request<DeleteSandboxRequest>) -> Result<Response<DeleteSandboxResponse>, Status> {
+        let id = request.into_inner().sandbox_id;
+        let Some(running) = self.sandboxes.lock().await.remove(&id) else {
+            return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
+        };
+        lifecycle::delete(&self.cfg, running).await;
+        self.announce(Payload::Deleted(WatchSandboxesDeletedEvent { sandbox_id: id }));
+        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
     type WatchSandboxesStream = WatchStream;
 
-    async fn watch_sandboxes(
-        &self,
-        _request: Request<WatchSandboxesRequest>,
-    ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        // No sandboxes yet: an open, silent stream.
-        Ok(Response::new(Box::pin(futures::stream::pending())))
+    async fn watch_sandboxes(&self, _request: Request<WatchSandboxesRequest>) -> Result<Response<Self::WatchSandboxesStream>, Status> {
+        // First replay what we have, then stream live changes.
+        let current: Vec<_> = self
+            .sandboxes
+            .lock()
+            .await
+            .values()
+            .map(|r| Ok(WatchSandboxesEvent {
+                payload: Some(Payload::Sandbox(WatchSandboxesSandboxEvent { sandbox: Some(r.sandbox.clone()) })),
+            }))
+            .collect();
+        let live = BroadcastStream::new(self.events.subscribe()).filter_map(|e| e.ok().map(Ok));
+        Ok(Response::new(Box::pin(tokio_stream::iter(current).chain(live))))
     }
 
-    async fn ensure_workspace(
-        &self,
-        _request: Request<EnsureWorkspaceRequest>,
-    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+    async fn ensure_workspace(&self, _request: Request<EnsureWorkspaceRequest>) -> Result<Response<EnsureWorkspaceResponse>, Status> {
         Ok(Response::new(EnsureWorkspaceResponse::default()))
     }
 
-    async fn delete_workspace(
-        &self,
-        _request: Request<DeleteWorkspaceRequest>,
-    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+    async fn delete_workspace(&self, _request: Request<DeleteWorkspaceRequest>) -> Result<Response<DeleteWorkspaceResponse>, Status> {
         Ok(Response::new(DeleteWorkspaceResponse::default()))
     }
 }

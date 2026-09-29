@@ -21,6 +21,9 @@
 //! NVIDIA's helper `bind_private` creates it readable only by our own user,
 //! and `SameUidUnixIncoming` rejects any process running as a different user.
 
+mod boundary;
+mod e2b;
+mod lifecycle;
 mod service;
 
 use clap::Parser;
@@ -40,8 +43,38 @@ struct Args {
     bind_socket: PathBuf,
 
     /// E2B template used for workload (agent) sandboxes.
-    #[arg(long, env = "OPENSHELL_E2B_TEMPLATE", default_value = "base")]
+    #[arg(long, env = "OPENSHELL_E2B_TEMPLATE", default_value = "openshell-workload")]
     template: String,
+
+    /// Tags every E2B box we create, so several control planes can share a team.
+    #[arg(long, env = "OPENSHELL_E2B_OWNER", default_value = "openshell-e2b")]
+    owner: String,
+
+    /// Where the E2B helper script lives, and the node binary to run it.
+    #[arg(long, env = "OPENSHELL_E2B_HELPER")]
+    helper: PathBuf,
+    #[arg(long, env = "OPENSHELL_E2B_NODE", default_value = "node")]
+    node: PathBuf,
+
+    /// NVIDIA's supervisor (patched build) and the tunnel client, on this machine.
+    #[arg(long, env = "OPENSHELL_E2B_SUPERVISOR")]
+    supervisor: PathBuf,
+    #[arg(long, env = "OPENSHELL_E2B_WSTUNNEL")]
+    wstunnel: PathBuf,
+
+    /// How supervisors reach the gateway, and the client certificate they use.
+    #[arg(long, env = "OPENSHELL_E2B_GATEWAY", default_value = "https://127.0.0.1:17670")]
+    gateway_endpoint: String,
+    #[arg(long, env = "OPENSHELL_E2B_GATEWAY_CA")]
+    gateway_ca: PathBuf,
+    #[arg(long, env = "OPENSHELL_E2B_GATEWAY_CERT")]
+    gateway_cert: PathBuf,
+    #[arg(long, env = "OPENSHELL_E2B_GATEWAY_KEY")]
+    gateway_key: PathBuf,
+
+    /// Per-sandbox local state (supervisor papers, logs).
+    #[arg(long, env = "OPENSHELL_E2B_STATE_DIR", default_value = "/tmp/openshell-e2b")]
+    state_dir: PathBuf,
 
     #[arg(long, env = "OPENSHELL_E2B_LOG", default_value = "info")]
     log_level: String,
@@ -60,13 +93,26 @@ async fn main() -> Result<()> {
     // the program exits, so a restart doesn't fail on "address in use".
     let listener = bind_private(&args.bind_socket).map_err(|e| miette::miette!(e))?;
     let _cleanup = SocketCleanup::new(args.bind_socket.clone());
-    info!(socket = %args.bind_socket.display(), template = %args.template, "starting E2B compute driver");
+    info!(socket = %args.bind_socket.display(), template = %args.template, owner = %args.owner, "starting E2B compute driver");
 
     // Serve NVIDIA's ComputeDriver gRPC interface (defined in their
     // compute_driver.proto) with our implementation in service.rs.
     // Runs until Ctrl-C / SIGINT.
+    let config = lifecycle::Config {
+        template: args.template,
+        e2b: e2b::E2b { node: args.node, helper: args.helper },
+        supervisor_bin: args.supervisor,
+        wstunnel_bin: args.wstunnel,
+        gateway_endpoint: args.gateway_endpoint,
+        gateway_ca: args.gateway_ca,
+        gateway_cert: args.gateway_cert,
+        gateway_key: args.gateway_key,
+        state_dir: args.state_dir,
+        owner: args.owner,
+    };
+
     tonic::transport::Server::builder()
-        .add_service(ComputeDriverServer::new(service::E2bDriver::new(args.template)))
+        .add_service(ComputeDriverServer::new(service::E2bDriver::new(config)))
         .serve_with_incoming_shutdown(SameUidUnixIncoming::new(listener), async {
             let _ = tokio::signal::ctrl_c().await;
         })

@@ -55,16 +55,45 @@ async function main() {
       if (!restart) return log(`${name}: already running`)
       await sbx.commands.run(`kill $(cat /tmp/run/${name}.pid) || true`)
     }
-    await sbx.commands.run(`cd /tmp && echo $$ > /tmp/run/${name}.pid && exec ${cmd} > /tmp/${name}.log 2>&1`, {
+    // timeoutMs: 0 matters. The SDK's default is 60 s even for background
+    // commands, so without it E2B kills the gateway after one minute.
+    const handle = await sbx.commands.run(`cd /tmp && echo $$ > /tmp/run/${name}.pid && exec ${cmd} > /tmp/${name}.log 2>&1`, {
       background: true,
+      timeoutMs: 0,
     })
+    await handle.disconnect()
     await new Promise((r) => setTimeout(r, 1000))
     log(`${name}: started`)
   }
-  await daemon('driver', 'driver/target/release/openshell-driver-e2b --bind-socket /tmp/run/e2b.sock')
+  // The driver reads the E2B API key from a 0600 file in the control box only.
+  // Agent boxes never receive it.
+  const restart = process.env.RESTART === '1'
+  await daemon('driver',
+    "sh -c 'set -a; . /home/user/.openshell-e2b.env; set +a; exec /home/user/driver/target/release/openshell-driver-e2b " +
+    '--bind-socket /tmp/run/e2b.sock --template openshell-workload ' +
+    '--helper /home/user/driver/e2b-helper.mjs --node /home/user/node/bin/node ' +
+    '--supervisor /home/user/bin/openshell-supervisor --wstunnel /home/user/bin/wstunnel ' +
+    '--gateway-ca /tmp/pki/ca.crt --gateway-cert /tmp/pki/client/tls.crt --gateway-key /tmp/pki/client/tls.key' + "'",
+    restart)
+  // Gateway config: token signing with the key generate-certs created.
+  // Without [gateway_jwt] the gateway can't mint launch credentials, and
+  // CreateSandbox arrives with no launch_authentication at all.
+  // ttl_secs = 3600: sandbox tokens expire and get renewed, never "forever".
+  await sbx.files.write('/home/user/gateway.toml', [
+    '[openshell]',
+    'version = 2',
+    '',
+    '[openshell.gateway.gateway_jwt]',
+    'signing_key_path = "/tmp/pki/jwt/signing.pem"',
+    'public_key_path  = "/tmp/pki/jwt/public.pem"',
+    'kid_path         = "/tmp/pki/jwt/kid"',
+    'gateway_id       = "openshell-e2b"',
+    'ttl_secs         = 3600',
+    '',
+  ].join('\n'))
   await daemon('gateway',
-    './openshell-gateway --tls-cert pki/server/tls.crt --tls-key pki/server/tls.key --tls-client-ca pki/ca.crt ' +
-    '--enable-mtls-auth true --compute-driver e2b --compute-driver-socket /tmp/run/e2b.sock')
+    './openshell-gateway --config /home/user/gateway.toml --tls-cert pki/server/tls.crt --tls-key pki/server/tls.key --tls-client-ca pki/ca.crt ' +
+    '--enable-mtls-auth true --compute-driver e2b --compute-driver-socket /tmp/run/e2b.sock', restart)
   // Always restart wstunnel: it must use this run's fresh secret path.
   await daemon('wstunnel',
     `./wstunnel server ws://0.0.0.0:${TUNNEL_PORT} --restrict-to 127.0.0.1:${GATEWAY_PORT} ` +
@@ -88,7 +117,12 @@ async function main() {
     '-H', `e2b-traffic-access-token: ${token}`,
     '--websocket-ping-frequency', '10s',
     `wss://${sbx.getHost(TUNNEL_PORT)}`,
-  ], { stdio: 'ignore' })
+  ], { stdio: ['ignore', 'ignore', 'pipe'] })
+  // Surface tunnel errors (bind failures, auth rejections) instead of hiding them.
+  client.stderr?.on('data', (d) => {
+    const line = String(d).trim()
+    if (/error|failed|denied|refused|in use/i.test(line)) log('tunnel client:', line.slice(0, 300))
+  })
   log(`tunnel open: laptop 127.0.0.1:${LOCAL_PORT} → gateway`)
   log(`in another terminal:  XDG_CONFIG_HOME=${CONFIG} .bin/openshell status`)
 
