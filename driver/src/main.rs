@@ -109,7 +109,8 @@ async fn main() -> Result<()> {
 
     // Serve NVIDIA's ComputeDriver gRPC interface (defined in their
     // compute_driver.proto) with our implementation in service.rs.
-    // Runs until Ctrl-C / SIGINT.
+    // Runs until SIGINT or SIGTERM. On either, the server stops and the
+    // sandbox table is dropped, which kills local supervisors and tunnels.
     let config = lifecycle::Config {
         template: args.template,
         e2b: e2b::E2b {
@@ -128,9 +129,20 @@ async fn main() -> Result<()> {
 
     tonic::transport::Server::builder()
         .add_service(ComputeDriverServer::new(service::E2bDriver::new(config)))
-        .serve_with_incoming_shutdown(SameUidUnixIncoming::new(listener), async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .serve_with_incoming_shutdown(SameUidUnixIncoming::new(listener), shutdown_signal())
         .await
         .into_diagnostic()
+}
+
+/// Resolve on SIGINT (Ctrl-C) or SIGTERM (what `kill` and process managers send).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }

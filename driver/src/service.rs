@@ -138,10 +138,12 @@ impl ComputeDriver for E2bDriver {
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        request
+        let sandbox = request
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+        // Reject what this driver can't honour, before any VM is allocated.
+        lifecycle::check_supported(&self.cfg, &sandbox).map_err(Status::invalid_argument)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -181,17 +183,19 @@ impl ComputeDriver for E2bDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+        lifecycle::check_supported(&self.cfg, &sandbox).map_err(Status::invalid_argument)?;
         let running = lifecycle::create(&self.cfg, &sandbox)
             .await
             .map_err(Status::internal)?;
         let runtime_identity = running.e2b_id.clone();
+        // Insert and announce under one lock, so a watcher that snapshots the
+        // table (also under the lock) sees the sandbox either way, never neither.
+        let mut table = self.sandboxes.lock().await;
         self.announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
             sandbox: Some(running.sandbox.clone()),
         }));
-        self.sandboxes
-            .lock()
-            .await
-            .insert(sandbox.id.clone(), running);
+        table.insert(sandbox.id.clone(), running);
+        drop(table);
         Ok(Response::new(CreateSandboxResponse { runtime_identity }))
     }
 
@@ -218,13 +222,22 @@ impl ComputeDriver for E2bDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let id = request.into_inner().sandbox_id;
-        let Some(running) = self.sandboxes.lock().await.remove(&id) else {
+        let Some(mut running) = self.sandboxes.lock().await.remove(&id) else {
             return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
         };
-        lifecycle::delete(&self.cfg, running).await;
+        // Keep the record if E2B didn't confirm the kill, so a retry can find
+        // the box again instead of leaking it until its timeout.
+        if let Err(e) = lifecycle::delete(&self.cfg, &mut running).await {
+            self.sandboxes.lock().await.insert(id, running);
+            return Err(Status::unavailable(format!(
+                "delete not confirmed, retry: {e}"
+            )));
+        }
+        let table = self.sandboxes.lock().await;
         self.announce(Payload::Deleted(WatchSandboxesDeletedEvent {
             sandbox_id: id,
         }));
+        drop(table);
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
@@ -234,11 +247,12 @@ impl ComputeDriver for E2bDriver {
         &self,
         _request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        // First replay what we have, then stream live changes.
-        let current: Vec<_> = self
-            .sandboxes
-            .lock()
-            .await
+        // Subscribe and snapshot under the same lock that create/delete hold
+        // while announcing: no event can slip between the snapshot and the
+        // live stream.
+        let table = self.sandboxes.lock().await;
+        let subscription = self.events.subscribe();
+        let current: Vec<_> = table
             .values()
             .map(|r| {
                 Ok(WatchSandboxesEvent {
@@ -248,7 +262,15 @@ impl ComputeDriver for E2bDriver {
                 })
             })
             .collect();
-        let live = BroadcastStream::new(self.events.subscribe()).filter_map(|e| e.ok().map(Ok));
+        drop(table);
+        // If this watcher falls too far behind, end the stream with an error
+        // instead of silently skipping events; the gateway re-subscribes and
+        // gets a fresh snapshot.
+        let live = BroadcastStream::new(subscription).map(|event| {
+            event.map_err(|_| {
+                Status::aborted("watch fell behind; re-subscribe for a fresh snapshot")
+            })
+        });
         Ok(Response::new(Box::pin(
             tokio_stream::iter(current).chain(live),
         )))

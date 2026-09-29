@@ -71,6 +71,7 @@ async function main() {
       '--http-upgrade-path-prefix', pathSecret,
       '-H', `e2b-traffic-access-token: ${sbx.trafficAccessToken}`,
       '--websocket-ping-frequency', PING,
+      '--tls-verify-certificate',
       `wss://${host}`,
     ], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, RUST_LOG: 'debug' } })
     client.stderr?.on('data', (d) => {

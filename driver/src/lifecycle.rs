@@ -157,7 +157,10 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, St
         }),
         Err(e) => {
             warn!(e2b = %e2b_id, error = %e, "create failed, deleting E2B box");
-            let _ = cfg.e2b.kill(&e2b_id).await;
+            if let Err(kill_error) = cfg.e2b.kill(&e2b_id).await {
+                // Don't hide this: the box stays alive until its E2B timeout.
+                tracing::error!(e2b = %e2b_id, error = %kill_error, "rollback failed; E2B box leaked until timeout");
+            }
             Err(e)
         }
     }
@@ -318,6 +321,9 @@ async fn provision_and_start(
             &format!("e2b-traffic-access-token: {}", boxed.traffic_access_token),
             "--websocket-ping-frequency",
             "10s",
+            // Verify E2B's TLS certificate. wstunnel skips this by default,
+            // which would let an interceptor capture the token and path.
+            "--tls-verify-certificate",
             &format!("wss://{}", boxed.host9000),
         ])
         .stdout(std::fs::File::create(dir.join("wstunnel.log")).map_err(|e| e.to_string())?)
@@ -383,13 +389,33 @@ fn child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> {
     vars
 }
 
-pub async fn delete(cfg: &Config, mut running: Running) {
+/// Stop the local processes and kill the E2B box. Returns an error if E2B
+/// didn't confirm, so the caller keeps the record and the delete can be retried.
+pub async fn delete(cfg: &Config, running: &mut Running) -> Result<(), String> {
     for child in &mut running.children {
         let _ = child.kill().await;
     }
-    if let Err(e) = cfg.e2b.kill(&running.e2b_id).await {
-        warn!(e2b = %running.e2b_id, error = %e, "E2B kill failed");
-    }
+    cfg.e2b.kill(&running.e2b_id).await?;
     let _ = tokio::fs::remove_dir_all(cfg.state_dir.join(&running.sandbox.id)).await;
     info!(sandbox = %running.sandbox.name, e2b = %running.e2b_id, "deleted");
+    Ok(())
+}
+
+/// Requests this driver cannot honour. Rejected up front rather than silently
+/// replaced with defaults: every agent box runs the one configured template,
+/// as uid/gid 1500, without user namespaces.
+pub fn check_supported(cfg: &Config, sandbox: &DriverSandbox) -> Result<(), String> {
+    let Some(template) = sandbox.spec.as_ref().and_then(|s| s.template.as_ref()) else {
+        return Ok(());
+    };
+    if !template.image.is_empty() && template.image != cfg.template {
+        return Err(format!(
+            "image '{}' is not supported; this driver runs E2B template '{}'",
+            template.image, cfg.template
+        ));
+    }
+    if template.user_namespaces == Some(true) {
+        return Err("user namespaces are not supported by the e2b driver".into());
+    }
+    Ok(())
 }

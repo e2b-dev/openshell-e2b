@@ -8,10 +8,11 @@
 //   │   + e2b-traffic-access-token header          │      → 127.0.0.1:17670 gateway   │
 //   └───────────────────────────┘                  └──────────────────────────────────┘
 //
-// Three locks, each enough on its own:
+// Layers of protection (defence in depth; the inner mTLS is what protects the session):
 //   1. E2B rejects requests without the sandbox's traffic access token
 //   2. wstunnel only accepts our random path and only forwards to the gateway port
-//   3. inside the tunnel, the CLI and gateway speak mutual TLS end to end
+//   3. the tunnel client verifies E2B's TLS certificate (otherwise 1 and 2 could be intercepted)
+//   4. inside the tunnel, the CLI and gateway speak mutual TLS end to end
 //
 // Usage: tsx scripts/connect.ts <control-sandbox-id>
 // Keeps running (it holds the tunnel open). Ctrl-C to stop.
@@ -116,6 +117,8 @@ async function main() {
     '--http-upgrade-path-prefix', pathSecret,
     '-H', `e2b-traffic-access-token: ${token}`,
     '--websocket-ping-frequency', '10s',
+    // Verify E2B's TLS certificate; wstunnel skips it by default.
+    '--tls-verify-certificate',
     `wss://${sbx.getHost(TUNNEL_PORT)}`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] })
   // Surface tunnel errors (bind failures, auth rejections) instead of hiding them.

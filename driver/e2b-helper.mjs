@@ -6,8 +6,10 @@
 //
 //   Rust driver (OpenShell logic)  ──JSON──►  e2b-helper.mjs  ──SDK──►  E2B API / envd
 //
-// Why a helper: E2B has no Rust SDK. The security-critical logic stays in Rust
-// (with NVIDIA's crates); this file only does plain box operations.
+// Why a helper: E2B has no Rust SDK. The OpenShell boundary logic (papers,
+// fence evidence, TLS) is in Rust with NVIDIA's crates. This helper is still
+// privileged: it holds the E2B API key and creates, writes to and kills boxes,
+// so it is part of the trusted control plane.
 //
 // Ops:
 //   create  {template, metadata, timeoutMs}         → {sandboxId, trafficAccessToken, host9000}
