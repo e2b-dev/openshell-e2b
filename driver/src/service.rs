@@ -33,7 +33,7 @@ use openshell_core::proto::compute::v1::{
     watch_sandboxes_event::Payload,
 };
 use openshell_core::resource_admission::{DriverAdmissionConfig, ResourceAdmissionConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast};
@@ -44,24 +44,59 @@ use tonic::{Request, Response, Status};
 pub const DRIVER_NAME: &str = "e2b";
 const IMPLEMENTATION: &str = "sudolabs/openshell-driver-e2b";
 
+/// State shared by the gRPC handlers, the driver-owned create/delete tasks,
+/// the health loop and the shutdown path.
+#[derive(Clone)]
+pub struct Shared {
+    pub cfg: Config,
+    /// `OpenShell` sandbox id → running sandbox.
+    pub sandboxes: Arc<Mutex<HashMap<String, Running>>>,
+    /// Sandbox ids with a create in flight (rejects duplicate creates).
+    pub pending: Arc<Mutex<HashSet<String>>>,
+    /// E2B boxes whose rollback failed; the health loop keeps retrying the kill.
+    pub leaked: Arc<Mutex<HashSet<String>>>,
+    /// Fan-out of changes to every open `WatchSandboxes` stream.
+    pub events: broadcast::Sender<WatchSandboxesEvent>,
+}
+
+impl Shared {
+    fn announce(&self, payload: Payload) {
+        // No listeners is fine: the gateway may not be watching yet.
+        let _ = self.events.send(WatchSandboxesEvent {
+            payload: Some(payload),
+        });
+    }
+}
+
 pub struct E2bDriver {
     cfg: Config,
-    /// `OpenShell` sandbox id → running sandbox.
+    shared: Shared,
     sandboxes: Arc<Mutex<HashMap<String, Running>>>,
-    /// Fan-out of changes to every open `WatchSandboxes` stream.
     events: broadcast::Sender<WatchSandboxesEvent>,
 }
 
 impl E2bDriver {
     pub fn new(cfg: Config) -> Self {
         let (events, _) = broadcast::channel(256);
-        let sandboxes: Arc<Mutex<HashMap<String, Running>>> = Arc::default();
-        crate::health::spawn(cfg.clone(), sandboxes.clone(), events.clone());
+        let shared = Shared {
+            cfg: cfg.clone(),
+            sandboxes: Arc::default(),
+            pending: Arc::default(),
+            leaked: Arc::default(),
+            events: events.clone(),
+        };
+        crate::health::spawn(shared.clone());
         Self {
             cfg,
-            sandboxes,
+            sandboxes: shared.sandboxes.clone(),
+            shared,
             events,
         }
+    }
+
+    /// A handle for the shutdown path in main.rs.
+    pub fn shared(&self) -> Shared {
+        self.shared.clone()
     }
 
     /// The handshake answer. The gateway refuses to start until it gets this.
@@ -97,13 +132,6 @@ impl E2bDriver {
                 [],
             )),
         }
-    }
-
-    fn announce(&self, payload: Payload) {
-        // No listeners is fine: the gateway may not be watching yet.
-        let _ = self.events.send(WatchSandboxesEvent {
-            payload: Some(payload),
-        });
     }
 }
 
@@ -186,18 +214,50 @@ impl ComputeDriver for E2bDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         lifecycle::check_supported(&self.cfg, &sandbox).map_err(Status::invalid_argument)?;
-        let running = lifecycle::create(&self.cfg, &sandbox)
+        let id = sandbox.id.clone();
+        {
+            // Reserve the id: a second create for the same sandbox is rejected
+            // instead of allocating another VM and overwriting the record.
+            let mut pending = self.shared.pending.lock().await;
+            if pending.contains(&id) || self.sandboxes.lock().await.contains_key(&id) {
+                return Err(Status::already_exists(
+                    "sandbox is already being created or exists",
+                ));
+            }
+            pending.insert(id.clone());
+        }
+        // The work runs in a driver-owned task: if the gateway cancels this
+        // request, provisioning still finishes (and is tracked) or rolls back.
+        let shared = self.shared.clone();
+        let task = tokio::spawn(async move {
+            let result = lifecycle::create(&shared.cfg, &sandbox).await;
+            let outcome = match result {
+                Ok(running) => {
+                    let runtime_identity = running.e2b_id.clone();
+                    // Insert and announce under one lock, so a watcher that
+                    // snapshots the table (also under the lock) sees it either way.
+                    let mut table = shared.sandboxes.lock().await;
+                    shared.announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
+                        sandbox: Some(running.sandbox.clone()),
+                    }));
+                    table.insert(sandbox.id.clone(), running);
+                    drop(table);
+                    Ok(runtime_identity)
+                }
+                Err(error) => {
+                    if let Some(box_id) = error.leaked_box {
+                        shared.leaked.lock().await.insert(box_id);
+                    }
+                    Err(error.message)
+                }
+            };
+            shared.pending.lock().await.remove(&sandbox.id);
+            outcome
+        });
+        let runtime_identity = task
             .await
+            .map_err(|e| Status::internal(format!("create task failed: {e}")))?
             .map_err(Status::internal)?;
-        let runtime_identity = running.e2b_id.clone();
-        // Insert and announce under one lock, so a watcher that snapshots the
-        // table (also under the lock) sees the sandbox either way, never neither.
-        let mut table = self.sandboxes.lock().await;
-        self.announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
-            sandbox: Some(running.sandbox.clone()),
-        }));
-        table.insert(sandbox.id.clone(), running);
-        drop(table);
         Ok(Response::new(CreateSandboxResponse { runtime_identity }))
     }
 
@@ -224,22 +284,61 @@ impl ComputeDriver for E2bDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let id = request.into_inner().sandbox_id;
-        let Some(mut running) = self.sandboxes.lock().await.remove(&id) else {
-            return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
+        // Mark the record as deleting (it stays in Get/List/Watch) and take
+        // what the cleanup needs. A second delete meanwhile is told to wait.
+        let (e2b_id, children) = {
+            let mut table = self.sandboxes.lock().await;
+            let Some(running) = table.get_mut(&id) else {
+                return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
+            };
+            if running.deleting {
+                return Err(Status::unavailable("delete already in progress"));
+            }
+            running.deleting = true;
+            if let Some(status) = running.sandbox.status.as_mut() {
+                status.deleting = true;
+            }
+            self.shared
+                .announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
+                    sandbox: Some(running.sandbox.clone()),
+                }));
+            let parts = (
+                running.e2b_id.clone(),
+                std::mem::take(&mut running.children),
+            );
+            drop(table); // announced under the lock; released right after
+            parts
         };
-        // Keep the record if E2B didn't confirm the kill, so a retry can find
-        // the box again instead of leaking it until its timeout.
-        if let Err(e) = lifecycle::delete(&self.cfg, &mut running).await {
-            self.sandboxes.lock().await.insert(id, running);
-            return Err(Status::unavailable(format!(
-                "delete not confirmed, retry: {e}"
-            )));
-        }
-        let table = self.sandboxes.lock().await;
-        self.announce(Payload::Deleted(WatchSandboxesDeletedEvent {
-            sandbox_id: id,
-        }));
-        drop(table);
+        // Driver-owned task: cancellation of this request can't abandon it.
+        let shared = self.shared.clone();
+        let task = tokio::spawn(async move {
+            let result = lifecycle::delete(&shared.cfg, &id, &e2b_id, children).await;
+            let mut table = shared.sandboxes.lock().await;
+            match &result {
+                // Only now, after E2B confirmed, the record goes away.
+                Ok(()) => {
+                    table.remove(&id);
+                    shared.announce(Payload::Deleted(WatchSandboxesDeletedEvent {
+                        sandbox_id: id,
+                    }));
+                }
+                // Keep the record so a retry can find the box; say what happened.
+                Err(e) => {
+                    if let Some(running) = table.get_mut(&id) {
+                        running.deleting = false;
+                        lifecycle::mark_not_ready(running, "DeleteFailed", e);
+                        shared.announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
+                            sandbox: Some(running.sandbox.clone()),
+                        }));
+                    }
+                }
+            }
+            drop(table);
+            result
+        });
+        task.await
+            .map_err(|e| Status::internal(format!("delete task failed: {e}")))?
+            .map_err(|e| Status::unavailable(format!("delete not confirmed, retry: {e}")))?;
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
