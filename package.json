@@ -1,0 +1,1 @@
+{"name":"openshell-e2b","private":true,"type":"module","scripts":{"template:builder":"tsx templates/builder.ts"},"dependencies":{"dotenv":"^18.0.4","e2b":"^2.51.0","tsx":"^4.23.15"}}

@@ -1,0 +1,21 @@
+[package]
+name = "openshell-driver-e2b"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "OpenShell compute driver that runs sandboxes on E2B"
+
+[dependencies]
+# NVIDIA OpenShell crates, pinned to the release we build against.
+openshell-core = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.2", default-features = false }
+openshell-sandbox-backend = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.2" }
+openshell-isolation-interface = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.2" }
+
+tokio = { version = "1.43", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+futures = "0.3"
+clap = { version = "4.5", features = ["derive", "env"] }
+miette = { version = "7", features = ["fancy"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
