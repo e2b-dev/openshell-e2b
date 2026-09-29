@@ -34,9 +34,10 @@ async function main() {
     const t0 = Date.now()
     // Both builds in one command, in parallel; the box has 8 cores.
     await sbx.commands.run(
-      `(cd /tmp/os && cargo build --release ${NVIDIA_BINS.map((b) => `--bin ${b}`).join(' ')}) > /tmp/os.log 2>&1 & ` +
-      '(cd /tmp/src/driver && cargo build --release) > /tmp/driver.log 2>&1 & ' +
-      'wait %1; a=$?; wait %2; b=$?; grep -hE "^error|Finished" /tmp/os.log /tmp/driver.log; exit $((a | b))',
+      // (wait by PID: job specs like %1 need job control, absent in non-interactive shells)
+      `(cd /tmp/os && cargo build --release ${NVIDIA_BINS.map((b) => `--bin ${b}`).join(' ')}) > /tmp/os.log 2>&1 & p1=$!; ` +
+      '(cd /tmp/src/driver && cargo build --release) > /tmp/driver.log 2>&1 & p2=$!; ' +
+      'wait $p1; a=$?; wait $p2; b=$?; grep -hE "^error|Finished" /tmp/os.log /tmp/driver.log; exit $((a | b))',
       { timeoutMs: 50 * 60_000, ...stream },
     )
     log(`builds took ${Math.round((Date.now() - t0) / 1000)}s`)
