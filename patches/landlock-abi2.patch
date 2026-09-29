@@ -1,0 +1,61 @@
+# Demo-only patch for OpenShell v0.1.2: accept Landlock ABI v2.
+# E2B's guest kernel is Linux 6.1 (Landlock ABI v2). OpenShell requires ABI v3
+# (kernel >= 6.2) for truncate control. With this patch, read-only paths are
+# NOT protected against truncate. Not for production. Real fix: kernel >= 6.2.
+diff --git a/crates/openshell-sandbox-backend/src/boundary_protocol.rs b/crates/openshell-sandbox-backend/src/boundary_protocol.rs
+index cb83bcf0..797fec84 100644
+--- a/crates/openshell-sandbox-backend/src/boundary_protocol.rs
++++ b/crates/openshell-sandbox-backend/src/boundary_protocol.rs
+@@ -145,7 +145,7 @@ impl NativeLinuxSandboxAuditEvidence {
+             && self.seccomp.task_memory_read
+             && self.seccomp.task_memory_write
+             && (self.seccomp.cancellation || self.seccomp.task_memory_writes_disabled)
+-            && self.landlock_abi >= 3
++            && self.landlock_abi >= 2
+             && self.landlock_allow_deny
+             && self.udp_dns_round_trip
+             && self.tcp_dns_round_trip
+@@ -165,7 +165,7 @@ impl NativeLinuxSandboxAuditEvidence {
+     pub fn properties(&self) -> BoundaryProperties {
+         BoundaryProperties {
+             filesystem_confinement: EnforcedProperty::new(
+-                self.landlock_abi >= 3 && self.landlock_allow_deny,
++                self.landlock_abi >= 2 && self.landlock_allow_deny,
+                 format!("landlock-v{}", self.landlock_abi),
+             ),
+             egress_interception: EnforcedProperty::new(
+diff --git a/crates/openshell-sandbox/src/main.rs b/crates/openshell-sandbox/src/main.rs
+index 4dad3307..8fd07429 100644
+--- a/crates/openshell-sandbox/src/main.rs
++++ b/crates/openshell-sandbox/src/main.rs
+@@ -212,7 +212,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
+     let landlock_abi = openshell_isolation_interface::linux::landlock::abi_version()
+         .into_diagnostic()
+         .wrap_err("Landlock ABI probe")?;
+-    if landlock_abi < 3 {
++    if landlock_abi < 2 {
+         return Err(miette::miette!(
+             "sandbox self-protection requires Landlock ABI v3 or newer (including truncation), found v{landlock_abi}"
+         ));
+diff --git a/crates/openshell-sandbox/src/sandbox/linux/landlock.rs b/crates/openshell-sandbox/src/sandbox/linux/landlock.rs
+index c18b633e..c9542081 100644
+--- a/crates/openshell-sandbox/src/sandbox/linux/landlock.rs
++++ b/crates/openshell-sandbox/src/sandbox/linux/landlock.rs
+@@ -139,7 +139,7 @@ pub fn prepare_capability_free_baseline() -> Result<PreparedRuleset> {
+ fn prepare_capability_free_baseline_at(root: &Path) -> Result<PreparedRuleset> {
+     // Unlike optional filesystem policy, self-protection must cover pathname
+     // truncation as well as opens. Never silently downgrade this ABI requirement.
+-    let abi = ABI::V3;
++    let abi = ABI::V2;
+     let access = AccessFs::from_all(abi);
+     let mut ruleset = Ruleset::default()
+         .set_compatibility(CompatLevel::HardRequirement)
+@@ -285,7 +285,7 @@ fn prepare_with_path_open_mode(
+     // Read-only policy must also deny pathname truncation. The mandatory
+     // baseline already qualifies ABI v3; optional best-effort policy keeps its
+     // independent compatibility behavior for other callers.
+-    let abi = ABI::V3;
++    let abi = ABI::V2;
+     openshell_ocsf::ocsf_emit!(
+         openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+             .severity(openshell_ocsf::SeverityId::Informational)

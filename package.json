@@ -1,0 +1,21 @@
+{
+  "name": "openshell-e2b",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "scripts/setup-bin.sh",
+    "template:builder": "tsx --env-file=.env templates/builder.ts",
+    "template:workload": "tsx --env-file=.env templates/workload.ts",
+    "build:binaries": "tsx --env-file=.env scripts/build-binaries.ts",
+    "connect": "tsx --env-file=.env scripts/connect.ts",
+    "sbx": "tsx --env-file=.env scripts/sbx.ts",
+    "spike:tunnel": "tsx --env-file=.env spikes/tunnel.ts",
+    "template:control": "tsx --env-file=.env templates/control.ts",
+    "demo": "scripts/demo.sh",
+    "watch": "tsx --env-file=.env scripts/watch.ts"
+  },
+  "dependencies": {
+    "e2b": "^2.51.0",
+    "tsx": "^4.23.15"
+  }
+}
