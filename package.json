@@ -12,6 +12,7 @@
     "spike:tunnel": "tsx --env-file=.env spikes/tunnel.ts",
     "template:control": "tsx --env-file=.env templates/control.ts",
     "demo": "scripts/demo.sh",
+    "fleet": "scripts/fleet.sh",
     "watch": "tsx --env-file=.env scripts/watch.ts"
   },
   "dependencies": {
