@@ -91,6 +91,7 @@ async function main() {
       'client', '-L', `tcp://127.0.0.1:${LOCAL + 1}:127.0.0.1:7000`,
       '--http-upgrade-path-prefix', 'wrong-path',
       '-H', `e2b-traffic-access-token: ${sbx.trafficAccessToken}`,
+      '--tls-verify-certificate', // it still carries the real token
       `wss://${host}`,
     ], { stdio: 'ignore' })
     await sleep(1500)

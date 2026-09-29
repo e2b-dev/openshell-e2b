@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
     // Refuse to start on a state directory another user could tamper with.
     lifecycle::private_dir(&args.state_dir).map_err(|e| miette::miette!(e))?;
     let listener = bind_private(&args.bind_socket).map_err(|e| miette::miette!(e))?;
-    let _cleanup = SocketCleanup::new(args.bind_socket.clone());
+    let cleanup = SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), template = %args.template, owner = %args.owner, "starting E2B compute driver");
 
     // Serve NVIDIA's ComputeDriver gRPC interface (defined in their
@@ -130,11 +130,47 @@ async fn main() -> Result<()> {
         owner: args.owner,
     };
 
-    tonic::transport::Server::builder()
-        .add_service(ComputeDriverServer::new(service::E2bDriver::new(config)))
-        .serve_with_incoming_shutdown(SameUidUnixIncoming::new(listener), shutdown_signal())
-        .await
-        .into_diagnostic()
+    let driver = service::E2bDriver::new(config);
+    let shared = driver.shared();
+    let server = tonic::transport::Server::builder()
+        .add_service(ComputeDriverServer::new(driver))
+        .serve_with_incoming(SameUidUnixIncoming::new(listener));
+
+    // Don't wait for the gateway's open watch stream to end on its own (it
+    // won't): on a signal, clean up and exit within a bounded time.
+    tokio::select! {
+        result = server => result.into_diagnostic(),
+        () = shutdown_signal() => {
+            info!("shutting down: stopping supervisors and tunnels, deleting E2B boxes");
+            if tokio::time::timeout(std::time::Duration::from_secs(15), shutdown(shared)).await.is_err() {
+                tracing::warn!("shutdown cleanup timed out; some E2B boxes may remain until their timeout");
+            }
+            drop(cleanup); // remove the socket file before exiting
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Stop every local helper process and kill every E2B box this driver owns.
+/// State is in memory only, so boxes left behind would be orphans.
+async fn shutdown(shared: service::Shared) {
+    let running: Vec<_> = shared.sandboxes.lock().await.drain().collect();
+    let leaked: Vec<_> = shared.leaked.lock().await.drain().collect();
+    let mut kills = Vec::new();
+    for (_, mut sandbox) in running {
+        for child in &mut sandbox.children {
+            let _ = child.start_kill();
+        }
+        let e2b = shared.cfg.e2b.clone();
+        kills.push(tokio::spawn(async move { e2b.kill(&sandbox.e2b_id).await }));
+    }
+    for box_id in leaked {
+        let e2b = shared.cfg.e2b.clone();
+        kills.push(tokio::spawn(async move { e2b.kill(&box_id).await }));
+    }
+    for kill in kills {
+        let _ = kill.await;
+    }
 }
 
 /// Resolve on SIGINT (Ctrl-C) or SIGTERM (what `kill` and process managers send).
