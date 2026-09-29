@@ -6,3 +6,4 @@ target/
 .openshell/
 .spike-*-id
 .control-id
+.DS_Store
