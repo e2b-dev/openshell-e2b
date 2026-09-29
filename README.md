@@ -59,7 +59,7 @@ npm run template:control     # control box template
 - **Landlock v2 patch.** E2B's guest kernel is Linux 6.1 (Landlock ABI v2). OpenShell v0.1.x requires ABI v3 (kernel ≥ 6.2) so read-only paths can't be truncated. This build accepts v2, so **read-only paths are not protected against truncate**. The real fix is an E2B kernel ≥ 6.2.
 - Stop/start (pause/resume) is not implemented. Driver state is in memory only.
 - One client certificate is shared by the CLI and supervisors.
-- Not yet hardened: provisioning isn't cancellation-safe; no health monitoring of supervisors/tunnels after start; the state directory isn't owner-verified. (From an external review; see git history.)
+- Provisioning isn't cancellation-safe yet (a create interrupted halfway can leave an E2B box until its timeout). Health monitoring and owner-checked state directories are in.
 - E2B teams with a 1-hour sandbox cap: the control box dies an hour after creation. Run `npm run connect -- --new` shortly before use.
 
 ## License
