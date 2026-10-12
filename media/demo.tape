@@ -124,13 +124,13 @@ Type "# GET is read-only: allowed"
 Enter
 Type `openshell sandbox exec -n demo --no-tty -- curl -s -w '  -> HTTP %{http_code}\n' https://api.github.com/zen`
 Enter
-Wait+Screen /-> HTTP \d{3}/
+Wait+Screen /-> HTTP 200/
 Sleep 2.5s
 Type "# POST is a write: blocked"
 Enter
 Type `openshell sandbox exec -n demo --no-tty -- curl -s -o /dev/null -w 'POST -> HTTP %{http_code}\n' -X POST https://api.github.com/gists`
 Enter
-Wait+Screen /POST -> HTTP \d{3}/
+Wait+Screen /POST -> HTTP 403/
 Sleep 2.5s
 Type "# same host, different program: blocked"
 Enter
@@ -153,7 +153,7 @@ Sleep 3s
 
 # ---- end card ----
 Hide
-Type `card "OpenShell + E2B" "✓ each agent in its own private E2B microVM" "✓ per-program network policy, HTTP-level rules, audit log" "✓ no keys or tokens inside the agent box" "" "github.com/e2b-dev/openshell-e2b"`
+Type `card "OpenShell + E2B" "✓ each agent in its own private E2B microVM" "✓ per-program network policy, HTTP-level rules, audit log" "✓ no API keys or gateway tokens in the agent box" "" "github.com/e2b-dev/openshell-e2b"`
 Enter
 Sleep 400ms
 Show

@@ -33,7 +33,7 @@ const g = '\x1b[32m', r = '\x1b[31m', y = '\x1b[33m', m = '\x1b[35m', c = '\x1b[
 const short = (id: string) => id.slice(0, 8)
 const COMPACT_RULES: [RegExp, (m: RegExpMatchArray) => string][] = [
   [/E2B box created .*e2b=(\w+)/, (k) => `${y}driver   ${x}▸ E2B microVM created ${d}${short(k[1])}${x}`],
-  [/fence check/, () => `${y}driver   ${x}▸ fence verified: loopback only`],
+  [/create failed|fence check failed/, () => `${r}driver   ▸ create failed (see driver log)${x}`],
   [/supervisor started/, () => `${y}driver   ${x}▸ tunnel 2 up, supervisor started`],
   [/CreateSandbox request completed/, () => `${m}gateway  ${x}▸ CreateSandbox done`],
   [/Isolation boundary attached/, () => `${c}superv.  ${x}▸ attached to fenced runtime ${d}(TLS 1.3)${x}`],

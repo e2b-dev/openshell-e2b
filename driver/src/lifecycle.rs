@@ -63,6 +63,24 @@ pub struct Running {
     pub sandbox: DriverSandbox,
     pub e2b_id: String,
     pub children: Vec<Child>,
+    /// A delete is in progress; the record stays visible until E2B confirms.
+    pub deleting: bool,
+}
+
+/// Why a create failed, and the E2B box it could not roll back (if any), so
+/// the caller can keep retrying that kill instead of losing track of it.
+pub struct CreateError {
+    pub message: String,
+    pub leaked_box: Option<String>,
+}
+
+impl From<String> for CreateError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            leaked_box: None,
+        }
+    }
 }
 
 /// Flip Ready to False with a reason. Returns true if anything changed, so the
@@ -175,8 +193,11 @@ async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     .map_err(|e| format!("write {shown}: {e}"))
 }
 
-pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, String> {
-    let spec = sandbox.spec.as_ref().ok_or("sandbox spec is required")?;
+pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, CreateError> {
+    let spec = sandbox
+        .spec
+        .as_ref()
+        .ok_or_else(|| String::from("sandbox spec is required"))?;
 
     // 1. The gateway's launch authentication: JWTs for the supervisor, and the
     //    session id + gateway public keys for the sandbox.
@@ -212,14 +233,21 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, St
             },
             e2b_id,
             children,
+            deleting: false,
         }),
-        Err(e) => {
-            warn!(e2b = %e2b_id, error = %e, "create failed, deleting E2B box");
-            if let Err(kill_error) = cfg.e2b.kill(&e2b_id).await {
-                // Don't hide this: the box stays alive until its E2B timeout.
-                tracing::error!(e2b = %e2b_id, error = %kill_error, "rollback failed; E2B box leaked until timeout");
-            }
-            Err(e)
+        Err(message) => {
+            warn!(e2b = %e2b_id, error = %message, "create failed, deleting E2B box");
+            let leaked_box = match cfg.e2b.kill(&e2b_id).await {
+                Ok(()) => None,
+                Err(kill_error) => {
+                    tracing::error!(e2b = %e2b_id, error = %kill_error, "rollback failed; will retry the kill");
+                    Some(e2b_id)
+                }
+            };
+            Err(CreateError {
+                message,
+                leaked_box,
+            })
         }
     }
 }
@@ -333,7 +361,7 @@ async fn provision_and_start(
         .run_background(
             e2b_id,
             &format!(
-                "for i in $(seq 50); do [ -S {sock} ] && break; sleep 0.2; done; \
+                "for i in $(seq 50); do [ -S {sock} ] && break; sleep 0.2; done; [ -S {sock} ] || exit 1; \
                  exec socat TCP-LISTEN:{SOCAT_PORT},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{sock} > /tmp/socat.log 2>&1",
                 sock = boundary::CONTROL_SOCKET_PATH
             ),
@@ -448,13 +476,18 @@ fn child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> {
 
 /// Stop the local processes and kill the E2B box. Returns an error if E2B
 /// didn't confirm, so the caller keeps the record and the delete can be retried.
-pub async fn delete(cfg: &Config, running: &mut Running) -> Result<(), String> {
-    for child in &mut running.children {
+pub async fn delete(
+    cfg: &Config,
+    sandbox_id: &str,
+    e2b_id: &str,
+    mut children: Vec<Child>,
+) -> Result<(), String> {
+    for child in &mut children {
         let _ = child.kill().await;
     }
-    cfg.e2b.kill(&running.e2b_id).await?;
-    let _ = tokio::fs::remove_dir_all(cfg.state_dir.join(&running.sandbox.id)).await;
-    info!(sandbox = %running.sandbox.name, e2b = %running.e2b_id, "deleted");
+    cfg.e2b.kill(e2b_id).await?;
+    let _ = tokio::fs::remove_dir_all(cfg.state_dir.join(sandbox_id)).await;
+    info!(sandbox_id, e2b = %e2b_id, "deleted");
     Ok(())
 }
 
@@ -462,6 +495,7 @@ pub async fn delete(cfg: &Config, running: &mut Running) -> Result<(), String> {
 /// replaced with defaults: every agent box runs the one configured template,
 /// as uid/gid 1500, without user namespaces.
 pub fn check_supported(cfg: &Config, sandbox: &DriverSandbox) -> Result<(), String> {
+    check_identity(sandbox)?;
     let Some(template) = sandbox.spec.as_ref().and_then(|s| s.template.as_ref()) else {
         return Ok(());
     };
@@ -473,6 +507,27 @@ pub fn check_supported(cfg: &Config, sandbox: &DriverSandbox) -> Result<(), Stri
     }
     if template.user_namespaces == Some(true) {
         return Err("user namespaces are not supported by the e2b driver".into());
+    }
+    Ok(())
+}
+
+/// The agent always runs as uid/gid 1500 ("sandbox" in the workload template).
+/// A request for any other user or group is rejected, not silently replaced.
+fn check_identity(sandbox: &DriverSandbox) -> Result<(), String> {
+    const ACCEPTED: [&str; 3] = ["", "sandbox", "1500"];
+    let Some(identity) = sandbox
+        .spec
+        .as_ref()
+        .and_then(|s| s.workload_identity.as_ref())
+    else {
+        return Ok(());
+    };
+    for (kind, selector) in [("user", &identity.user), ("group", &identity.group)] {
+        if !ACCEPTED.contains(&selector.as_str()) {
+            return Err(format!(
+                "workload {kind} '{selector}' is not supported; the e2b driver runs the agent as sandbox (1500)"
+            ));
+        }
     }
     Ok(())
 }
@@ -493,7 +548,10 @@ mod tests {
     fn creates_new_dir_as_0700() {
         let dir = scratch("new");
         assert!(private_dir(&dir).is_ok());
-        assert_eq!(std::fs::metadata(&dir).map(|m| m.mode() & 0o777).ok(), Some(0o700));
+        assert_eq!(
+            std::fs::metadata(&dir).map(|m| m.mode() & 0o777).ok(),
+            Some(0o700)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -18,12 +18,14 @@ step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 NAME="${1:-demo-$(date +%H%M%S)}"
 POLICY="$(mktemp)"
+trap 'os sandbox delete "$NAME" >/dev/null 2>&1 || true; rm -f "$POLICY"' EXIT
 
 step "1. create sandbox '$NAME'"
 start=$(date +%s)
 # The main process is `sleep infinity`; create attaches to it, so run it in the background.
 (os sandbox create --name "$NAME" --no-tty -- sleep infinity >/dev/null 2>&1 &)
-until os sandbox list 2>/dev/null | grep -q "^$NAME .*Ready"; do sleep 1; done
+for _ in $(seq 120); do os sandbox list 2>/dev/null | grep -q "^$NAME .*Ready" && break; sleep 1; done
+os sandbox list 2>/dev/null | grep -q "^$NAME .*Ready" || { echo "sandbox not Ready after 120 s" >&2; exit 1; }
 echo "Ready after $(( $(date +%s) - start ))s"
 os sandbox list | grep -E "^NAME|^$NAME "
 
@@ -53,15 +55,20 @@ EOF
 os policy set "$NAME" --policy "$POLICY" --wait | tail -1
 
 step "5. enforcement"
-in_sandbox '
+result=$(in_sandbox '
   printf "curl GET  api.github.com/zen   -> "; curl -sS -m 10 -o /tmp/z -w "HTTP %{http_code}" https://api.github.com/zen; echo "  \"$(cat /tmp/z)\""
   printf "curl POST api.github.com/gists -> "; curl -sS -m 10 -o /dev/null -w "HTTP %{http_code}\n" -X POST -d "{}" https://api.github.com/gists
   printf "wget GET  api.github.com/zen   -> "; wget -q -T 5 -t 1 -O /dev/null https://api.github.com/zen && echo allowed || echo denied
-'
+')
+echo "$result"
+# The demo only counts if the policy did exactly what it says.
+grep -q "GET  api.github.com/zen   -> HTTP 200" <<<"$result" || { echo "FAIL: expected GET 200" >&2; exit 1; }
+grep -q "POST api.github.com/gists -> HTTP 403" <<<"$result" || { echo "FAIL: expected POST 403" >&2; exit 1; }
+grep -q "wget GET  api.github.com/zen   -> denied" <<<"$result" || { echo "FAIL: expected wget denied" >&2; exit 1; }
 
 step "6. audit log (OCSF)"
 os logs "$NAME" 2>/dev/null | grep -E "NET:OPEN|HTTP:" | tail -5 | cut -c1-160
 
 step "7. delete"
 os sandbox delete "$NAME"
-rm -f "$POLICY"
+trap 'rm -f "$POLICY"' EXIT

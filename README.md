@@ -25,7 +25,7 @@ laptop                     E2B control box                       E2B agent box
 ```
 
 - **Tunnels** go through E2B's HTTPS port address: E2B traffic token + random secret path + E2B certificate verification + OpenShell TLS inside, with a 10 s heartbeat.
-- **The agent box holds no secrets.** The E2B API key, gateway JWTs and traffic tokens stay in the control box.
+- **No control-plane credentials in the agent box.** The E2B API key, gateway JWTs and E2B traffic tokens stay in the control box. The agent box holds only what its own side of the session needs: the per-session TLS key (read by the runtime before the agent starts) and the gateway's public keys.
 - **The driver** is Rust on NVIDIA's own crates (pinned to `v0.1.2`) for the boundary protocol. E2B calls go through `driver/e2b-helper.mjs` (E2B's official JS SDK), because E2B has no Rust SDK.
 
 ## Run the demo
@@ -67,8 +67,9 @@ npm run template:control     # control box template
 - **Landlock v2 patch.** E2B's guest kernel is Linux 6.1 (Landlock ABI v2). OpenShell v0.1.x requires ABI v3 (kernel ≥ 6.2) so read-only paths can't be truncated. This build accepts v2, so **read-only paths are not protected against truncate**. The real fix is an E2B kernel ≥ 6.2.
 - Stop/start (pause/resume) is not implemented. Driver state is in memory only.
 - One client certificate is shared by the CLI and supervisors.
-- Provisioning isn't cancellation-safe yet (a create interrupted halfway can leave an E2B box until its timeout). Health monitoring and owner-checked state directories are in.
-- E2B teams with a 1-hour sandbox cap: the control box dies an hour after creation. Run `npm run connect -- --new` shortly before use.
+- The fence evidence records the template name (`openshell-workload`), not an immutable build ID.
+- Create and delete run as driver-owned tasks (safe if the gateway cancels a request); a box whose rollback fails is retried until it's gone. Health monitoring and owner-checked state directories are in.
+- Boxes are created with a 1-hour timeout (the maximum on some E2B plans). The control box dies an hour after creation: run `npm run connect -- --new` shortly before use.
 
 ## License
 

@@ -30,7 +30,7 @@ export const template = Template({ fileContextPath: process.cwd() })
     `curl -fsSL ${WSTUNNEL} | tar xz -C ${ROOT}/bin wstunnel`,
     `chmod 755 ${ROOT}/bin/*`,
     `mkdir -p ${ROOT}/node && curl -fsSL https://nodejs.org/dist/${NODE}/node-${NODE}-linux-x64.tar.xz | tar xJ -C ${ROOT}/node --strip-components=1`,
-    `cd ${ROOT}/helper && echo '{"type":"module","private":true}' > package.json && PATH=${ROOT}/node/bin:$PATH npm install --silent e2b`,
+    `cd ${ROOT}/helper && echo '{"type":"module","private":true}' > package.json && PATH=${ROOT}/node/bin:$PATH npm install --silent e2b@2.51.0`,
   ], { user: 'root' })
 
 Template.build(template, 'openshell-control', {
