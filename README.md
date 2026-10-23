@@ -65,6 +65,17 @@ Local state is isolated from the original demo: `.control-separated-id`, `.opens
 npm run demo:down       # deletes this control plane's task VMs and the control VM
 ```
 
+## Three-pane live demo and video
+
+```bash
+npm run demo:studio     # interactive: walkthrough, supervisor audit, worker heartbeat
+npm run demo:record     # live run → media/separated-supervisor-demo.mp4 (45 seconds)
+```
+
+The left pane runs `studio create`, `studio fence`, `studio policy`, `studio requests`, `studio sever`, and `studio cleanup`. The upper-right pane streams audit records directly from supervisor A. The lower-right pane reads the agent heartbeat and kernel process state directly from worker B. `studio sever` destroys only this demo's supervisor VM: the worker survives, its agent freezes, and a root-level HTTPS probe remains blocked by E2B's network fence.
+
+The recorder requires VHS, tmux, gum, FFmpeg and the Menlo font. It connects the gateway automatically, records the real commands, and accelerates the capture into a 45-second 1080p MP4. Export requires 14 live assertions plus GET-allow and POST-deny records from the supervisor feed. The full-speed capture, assertion report and source audit events are saved under `dist/studio/`. Detach with Ctrl-B, D to close the interactive studio; the launcher cleans up its task pair and any laptop tunnel it started. The shared control VM remains available. No other task pairs are removed.
+
 ## Build and test
 
 ```bash

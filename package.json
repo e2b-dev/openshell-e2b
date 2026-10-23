@@ -17,7 +17,10 @@
     "template:supervisor": "tsx --env-file=.env templates/supervisor.ts",
     "demo:verify": "tsx --env-file=.env scripts/demo-separated.ts --fault",
     "typecheck": "tsc --noEmit",
-    "demo:down": "tsx --env-file=.env scripts/demo-down.ts"
+    "demo:down": "tsx --env-file=.env scripts/demo-down.ts",
+    "studio": "tsx --env-file=.env scripts/studio.ts",
+    "demo:studio": "bash scripts/studio.sh",
+    "demo:record": "bash scripts/studio.sh --record"
   },
   "dependencies": {
     "e2b": "^2.51.0",

@@ -31,6 +31,14 @@ Observed create-to-gateway-Ready times were 10.5 seconds for the standard run an
 
 The live log viewer also discovered sandbox A automatically and streamed its policy load, HTTP allow/deny and program-identity audit events alongside the shared gateway and driver logs.
 
+## Three-pane studio recording
+
+The [45-second recording](../media/separated-supervisor-demo.mp4) was captured from a live task pair on 2026-10-23. Supervisor A was `izp5c9p5qf0ddihua8d8d`; worker B was `i8yxqv6k05hd4r4t41yqy`. The 63.72-second capture is accelerated to approximately 1.42× playback at 1920×1080.
+
+All 14 studio assertions passed, including a heartbeat that continued through the policy update, actual GET-allow and POST-deny audit events from A, and an agent frozen at heartbeat 79 after A was terminated. B's kernel reported the agent stopped; its heartbeat remained unchanged; a fresh root HTTPS probe still failed. Both task VMs were removed and the existing shared control plane remained available. The captured results are in [studio-recording.json](studio-recording.json).
+
+Reproduce the recording with `npm run demo:record`, or open the interactive three-pane layout with `npm run demo:studio`.
+
 ## Build checks
 
 - Rust release build succeeded in an E2B Linux builder.
