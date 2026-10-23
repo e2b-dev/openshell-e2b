@@ -26,6 +26,14 @@ async function main() {
       { timeoutMs: 180_000, ...stream },
     )
 
+    // eMudhra fix; remove once the pin moves to an NVIDIA release containing #4794.
+    await sbx.commands.run(
+      'cd /tmp/os && cargo update -p rustls-webpki --precise 0.103.16 && ' +
+      'cargo update -p webpki-roots --precise 1.0.10 && ' +
+      'cargo update -p webpki-root-certs --precise 1.0.10',
+      { timeoutMs: 180_000, ...stream },
+    )
+
     // Our driver source (committed files only, no target/ or secrets).
     const tar = execFileSync('git', ['archive', 'HEAD', 'driver'])
     await sbx.files.write('/tmp/driver.tar', tar.buffer.slice(tar.byteOffset, tar.byteOffset + tar.byteLength) as ArrayBuffer)

@@ -48,6 +48,8 @@ npm run template:workload    # agent box template
 npm run template:control     # control box template
 ```
 
+`build:binaries` backports the eMudhra fix to NVIDIA v0.1.2 with rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs 1.0.10 before compiling.
+
 ## Layout
 
 | Path | What |
