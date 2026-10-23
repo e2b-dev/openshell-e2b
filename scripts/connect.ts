@@ -1,15 +1,15 @@
 // connect.ts: bring up (or reconnect to) the OpenShell control plane on E2B
 // and link your laptop's `openshell` CLI to it. One command:
 //
-//   npm run connect              reuse the control box in .control-id, or create one
+//   npm run connect              reuse the control box in .control-separated-id, or create one
 //   npm run connect -- --new     always create a fresh control box
 //
-//   laptop                                         E2B control sandbox (private, openshell-control template)
+//   laptop                                         E2B control sandbox (private, openshell-control-separated template)
 //   ┌───────────────────────────┐                  ┌──────────────────────────────────────────────┐
 //   │ openshell CLI             │                  │  wstunnel server :9000 (secret path only)     │
-//   │   → https://127.0.0.1:17690                  │     → 127.0.0.1:17670 openshell-gateway        │
-//   │ wstunnel client :17690 ═══╪══ wss:// ════════╪══►        ↕ unix socket                       │
-//   │   + e2b-traffic-access-token header          │     openshell-driver-e2b → E2B API (agent boxes) │
+//   │   → https://127.0.0.1:17691                  │     → 127.0.0.1:17670 openshell-gateway        │
+//   │ wstunnel client :17691 ═══╪══ wss:// ════════╪══►        ↕ unix socket                       │
+//   │   + e2b-traffic-access-token header          │     openshell-driver-e2b → E2B API (task pairs) │
 //   └───────────────────────────┘                  └──────────────────────────────────────────────┘
 //
 // Layers of protection (defence in depth; the inner mTLS is what protects the session):
@@ -29,12 +29,12 @@ import { Sandbox } from 'e2b'
 
 const GATEWAY_PORT = 17670 // gateway inside the control box (localhost only)
 const TUNNEL_PORT = 9000 // the only port we use through E2B's proxy
-const LOCAL_PORT = 17690 // where the CLI connects on the laptop
-const GATEWAY_NAME = 'e2b'
-const ROOT = '/opt/openshell-e2b' // baked into the openshell-control template
+const LOCAL_PORT = 17691 // where the CLI connects on the laptop
+const GATEWAY_NAME = 'e2b-separated'
+const ROOT = '/opt/openshell-e2b' // baked into the openshell-control-separated template
 const STATE = '/home/user/openshell' // per-box: certificates, config, logs
-const CONFIG = `${process.cwd()}/.openshell` // isolated CLI config on the laptop (gitignored)
-const ID_FILE = '.control-id'
+const CONFIG = `${process.cwd()}/.openshell-separated` // isolated CLI config on the laptop (gitignored)
+const ID_FILE = '.control-separated-id'
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a)
 
@@ -51,7 +51,7 @@ async function controlBox(): Promise<Sandbox> {
       }
     }
   }
-  const sbx = await Sandbox.create('openshell-control', {
+  const sbx = await Sandbox.create('openshell-control-separated', {
     timeoutMs: 60 * 60_000,
     network: { allowPublicTraffic: false },
     metadata: { 'openshell.ai/role': 'control-plane' },
@@ -131,14 +131,27 @@ async function main() {
     await sleep(1000)
     log(`${name}: started`)
   }
+  // Persist the transport path: reconnecting a laptop must not invalidate
+  // the gateway channel of existing task supervisors.
+  const pathFile = `${STATE}/gateway-path`
+  const pathSecret = (await exists(pathFile))
+    ? (await sbx.files.read(pathFile)).trim()
+    : randomBytes(16).toString('hex')
+  await sbx.files.write(pathFile, pathSecret)
+  await sbx.files.write(`${STATE}/gateway-tunnel.json`, JSON.stringify({
+    host: sbx.getHost(TUNNEL_PORT), token, path: pathSecret,
+  }))
+  await sbx.commands.run(`chmod 600 ${pathFile} ${STATE}/gateway-tunnel.json`)
   const restart = process.env.RESTART === '1'
-  // The driver reads the E2B API key from driver.env. Agent boxes never get it.
+  await daemon('wstunnel',
+    `${ROOT}/bin/wstunnel server ws://0.0.0.0:${TUNNEL_PORT} --restrict-to 127.0.0.1:${GATEWAY_PORT} ` +
+    `--restrict-http-upgrade-path-prefix ${pathSecret}`, restart)
   await daemon('driver',
     `sh -c 'set -a; . ${STATE}/driver.env; set +a; exec ${ROOT}/bin/openshell-driver-e2b ` +
-    `--bind-socket ${STATE}/run/e2b.sock --template openshell-workload ` +
+    `--bind-socket ${STATE}/run/e2b.sock --template openshell-workload-separated ` +
+    `--supervisor-template openshell-supervisor-separated --owner ${sbx.sandboxId} ` +
     `--helper ${ROOT}/helper/e2b-helper.mjs --node ${ROOT}/node/bin/node ` +
-    `--supervisor ${ROOT}/bin/openshell-supervisor --wstunnel ${ROOT}/bin/wstunnel ` +
-    `--state-dir ${STATE}/sandboxes ` +
+    `--gateway-tunnel ${STATE}/gateway-tunnel.json --state-dir ${STATE}/sandboxes ` +
     `--gateway-ca ${STATE}/pki/ca.crt --gateway-cert ${STATE}/pki/client/tls.crt --gateway-key ${STATE}/pki/client/tls.key'`,
     restart)
   await daemon('gateway',
@@ -146,12 +159,14 @@ async function main() {
     `--tls-cert ${STATE}/pki/server/tls.crt --tls-key ${STATE}/pki/server/tls.key --tls-client-ca ${STATE}/pki/ca.crt ` +
     `--enable-mtls-auth true --compute-driver e2b --compute-driver-socket ${STATE}/run/e2b.sock`,
     restart)
-  // Always restart the tunnel server: it must use this run's fresh secret path.
-  const pathSecret = randomBytes(16).toString('hex')
-  await daemon('wstunnel',
-    `${ROOT}/bin/wstunnel server ws://0.0.0.0:${TUNNEL_PORT} --restrict-to 127.0.0.1:${GATEWAY_PORT} ` +
-    `--restrict-http-upgrade-path-prefix ${pathSecret}`,
-    true)
+
+  // `gateway add --local` requires the client certificates to exist already.
+  const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`
+  await mkdir(mtls, { recursive: true, mode: 0o700 })
+  for (const [remote, local] of [['pki/ca.crt', 'ca.crt'], ['pki/client/tls.crt', 'tls.crt'], ['pki/client/tls.key', 'tls.key']]) {
+    await writeFile(`${mtls}/${local}`, await sbx.files.read(`${STATE}/${remote}`))
+    await chmod(`${mtls}/${local}`, 0o600)
+  }
 
   // Register the gateway with the isolated CLI config, unless it already is.
   const cli = (args: string[]) =>
@@ -160,16 +175,6 @@ async function main() {
   if (!registered) {
     cli(['gateway', 'add', '--local', '--name', GATEWAY_NAME, `https://127.0.0.1:${LOCAL_PORT}`])
     log(`CLI: registered gateway '${GATEWAY_NAME}'`)
-  }
-
-  // The CLI's client certificate. These files ARE the login: whoever holds
-  // tls.key can talk to the gateway. Written after `gateway add --local`,
-  // which copies in the certs of any local OpenShell gateway on this laptop.
-  const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`
-  await mkdir(mtls, { recursive: true, mode: 0o700 })
-  for (const [remote, local] of [['pki/ca.crt', 'ca.crt'], ['pki/client/tls.crt', 'tls.crt'], ['pki/client/tls.key', 'tls.key']]) {
-    await writeFile(`${mtls}/${local}`, await sbx.files.read(`${STATE}/${remote}`))
-    await chmod(`${mtls}/${local}`, 0o600)
   }
 
   // Open the tunnel on the laptop. 10 s heartbeat: spike A showed E2B's
@@ -182,7 +187,11 @@ async function main() {
     // Verify E2B's TLS certificate; wstunnel skips it by default.
     '--tls-verify-certificate',
     `wss://${sbx.getHost(TUNNEL_PORT)}`,
-  ], { stdio: ['ignore', 'ignore', 'pipe'] })
+  ], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    // wstunnel expects a boolean, while many terminal tools set NO_COLOR=1.
+    env: { ...process.env, NO_COLOR: 'true' },
+  })
   // Surface tunnel errors (bind failures, auth rejections) instead of hiding them.
   client.stderr?.on('data', (d) => {
     const line = String(d).trim()

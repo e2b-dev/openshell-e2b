@@ -1,24 +1,7 @@
-//! Create and delete sandboxes. This is where the pieces meet.
-//!
-//! CREATE, step by step (numbers match the comments below):
-//!
-//!   gateway ── CreateSandbox(spec + `launch_authentication`) ──► driver
-//!     1  decode the gateway's signed launch authentication
-//!     2  create a private E2B box from the openshell-workload template
-//!     3  build the fence (netns with only loopback) and check it
-//!     4  make this session's TLS cert and both security papers (NVIDIA code)
-//!     5  write bootstrap.json + cert + key into the box, owned by uid 1500
-//!     6  start openshell-sandbox inside the fence
-//!     7  start socat + wstunnel in the box (tunnel 2, server side)
-//!     8  start the wstunnel client here (tunnel 2, local end on 127.0.0.1:<port>)
-//!     9  start openshell-supervisor here, pointed at that port
-//!   gateway ◄── supervisor connects ── sandbox becomes Ready
-//!
-//! Secrets and where they live:
-//!   gateway/sandbox JWTs ........ control box only (supervisor auth bundle, 0600)
-//!   E2B API key ................. control box only (driver environment)
-//!   traffic access token ........ control box only (wstunnel client header)
-//!   agent box ................... session TLS key + gateway PUBLIC keys. No tokens.
+//! One task = a supervisor microVM plus a worker microVM.
+//! The shared gateway/driver owns both lifecycles; no task processes run here.
+//! E2B denies worker egress outside the guest. `OpenShell` keeps its runtime
+//! fence and session-authenticated channel inside that boundary.
 
 use crate::boundary::{self, E2bBoundarySpec};
 use crate::e2b::E2b;
@@ -31,9 +14,9 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use rand::RngCore;
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use tokio::process::{Child, Command};
+
 use tracing::{info, warn};
 
 const WORKLOAD_UID: u32 = 1500;
@@ -41,28 +24,28 @@ const WORKLOAD_UID: u32 = 1500;
 const TUNNEL_PORT: u16 = 9000;
 /// socat inside the agent box: TCP 127.0.0.1:7000 → control.sock.
 const SOCAT_PORT: u16 = 7000;
+const DIR: &str = "/run/openshell-task";
 
 /// Everything the driver needs to know about its surroundings.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub template: String,
     pub e2b: E2b,
-    pub supervisor_bin: PathBuf,
-    pub wstunnel_bin: PathBuf,
+    pub supervisor_template: String,
+    pub gateway_tunnel: PathBuf,
     pub gateway_endpoint: String,
     /// Client cert the supervisor uses to reach the gateway with mutual TLS.
     pub gateway_ca: PathBuf,
     pub gateway_cert: PathBuf,
     pub gateway_key: PathBuf,
-    pub state_dir: PathBuf,
     pub owner: String,
 }
 
-/// A running sandbox: its `OpenShell` record plus the local helper processes.
+/// Both microVMs belong to exactly one `OpenShell` sandbox.
 pub struct Running {
     pub sandbox: DriverSandbox,
     pub e2b_id: String,
-    pub children: Vec<Child>,
+    pub supervisor_id: String,
     /// A delete is in progress; the record stays visible until E2B confirms.
     pub deleting: bool,
 }
@@ -71,14 +54,14 @@ pub struct Running {
 /// the caller can keep retrying that kill instead of losing track of it.
 pub struct CreateError {
     pub message: String,
-    pub leaked_box: Option<String>,
+    pub leaked_boxes: Vec<String>,
 }
 
 impl From<String> for CreateError {
     fn from(message: String) -> Self {
         Self {
             message,
-            leaked_box: None,
+            leaked_boxes: Vec::new(),
         }
     }
 }
@@ -112,11 +95,6 @@ fn status(message: &str, ready: bool, e2b_id: &str, reason: &str) -> DriverSandb
         }],
         ..Default::default()
     }
-}
-
-fn free_local_port() -> std::io::Result<SocketAddr> {
-    // Ask the OS for a free port, then release it for wstunnel to bind.
-    TcpListener::bind("127.0.0.1:0")?.local_addr()
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -168,31 +146,6 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let shown = path.display().to_string();
-    let path = path.to_path_buf();
-    let bytes = bytes.to_vec();
-    tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        // 0600 from the moment the file exists, and never follow a symlink
-        // someone planted where a secret should go (O_NOFOLLOW).
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
-        // An existing file keeps its old mode on open; force 0600 either way.
-        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        f.write_all(&bytes)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| format!("write {shown}: {e}"))
-}
-
 pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, CreateError> {
     let spec = sandbox
         .spec
@@ -208,47 +161,69 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, Cr
     let session_id = auth.supervisor.session_id;
     let generation = auth.supervisor.runtime_generation.to_string();
 
-    // 2. A private E2B box. Metadata lets `list` and cleanup find our boxes.
-    let metadata = serde_json::json!({
-        "openshell.ai/managed-by": "openshell-e2b",
-        "openshell.ai/driver-owner": cfg.owner,
-        "openshell.ai/sandbox-id": sandbox.id,
-        "openshell.ai/sandbox-name": sandbox.name,
-    });
-    let boxed = cfg.e2b.create(&cfg.template, metadata).await?;
-    let e2b_id = boxed.sandbox_id.clone();
-    info!(sandbox = %sandbox.name, e2b = %e2b_id, "E2B box created");
+    let metadata = |role: &str| {
+        serde_json::json!({
+            "openshell.ai/managed-by": "openshell-e2b",
+            "openshell.ai/driver-owner": cfg.owner,
+            "openshell.ai/sandbox-id": sandbox.id,
+            "openshell.ai/sandbox-name": sandbox.name,
+            "openshell.ai/role": role,
+        })
+    };
+    // Create B first, then A. Every failure rolls back everything allocated.
+    let worker = cfg
+        .e2b
+        .create(&cfg.template, metadata("worker"), false)
+        .await?;
+    let supervisor = match cfg
+        .e2b
+        .create(&cfg.supervisor_template, metadata("supervisor"), true)
+        .await
+    {
+        Ok(created) => created,
+        Err(message) => return Err(rollback(cfg, message, &[&worker.sandbox_id]).await),
+    };
+    info!(sandbox = %sandbox.name, worker = %worker.sandbox_id, supervisor = %supervisor.sandbox_id, "E2B task pair created");
+    if let Err(message) = provision_and_start(
+        cfg,
+        sandbox,
+        &auth,
+        session_id,
+        &generation,
+        &worker,
+        &supervisor,
+    )
+    .await
+    {
+        return Err(rollback(cfg, message, &[&supervisor.sandbox_id, &worker.sandbox_id]).await);
+    }
+    Ok(Running {
+        sandbox: DriverSandbox {
+            status: Some(status(
+                "Separate supervisor and worker started",
+                true,
+                &worker.sandbox_id,
+                "BackendReady",
+            )),
+            ..sandbox.clone()
+        },
+        e2b_id: worker.sandbox_id,
+        supervisor_id: supervisor.sandbox_id,
+        deleting: false,
+    })
+}
 
-    // From here on, delete the box if anything fails.
-    match provision_and_start(cfg, sandbox, &auth, session_id, &generation, &boxed).await {
-        Ok(children) => Ok(Running {
-            sandbox: DriverSandbox {
-                status: Some(status(
-                    "OpenShell runtime and supervisor started",
-                    true,
-                    &e2b_id,
-                    "BackendReady",
-                )),
-                ..sandbox.clone()
-            },
-            e2b_id,
-            children,
-            deleting: false,
-        }),
-        Err(message) => {
-            warn!(e2b = %e2b_id, error = %message, "create failed, deleting E2B box");
-            let leaked_box = match cfg.e2b.kill(&e2b_id).await {
-                Ok(()) => None,
-                Err(kill_error) => {
-                    tracing::error!(e2b = %e2b_id, error = %kill_error, "rollback failed; will retry the kill");
-                    Some(e2b_id)
-                }
-            };
-            Err(CreateError {
-                message,
-                leaked_box,
-            })
+async fn rollback(cfg: &Config, message: String, ids: &[&str]) -> CreateError {
+    let mut leaked_boxes = Vec::new();
+    for id in ids {
+        if let Err(error) = cfg.e2b.kill(id).await {
+            warn!(e2b = %id, %error, "rollback failed; health monitor will retry");
+            leaked_boxes.push((*id).to_owned());
         }
+    }
+    CreateError {
+        message,
+        leaked_boxes,
     }
 }
 
@@ -259,7 +234,8 @@ async fn provision_and_start(
     session_id: openshell_core::SandboxSessionId,
     generation: &str,
     boxed: &crate::e2b::Created,
-) -> Result<Vec<Child>, String> {
+    supervisor_box: &crate::e2b::Created,
+) -> Result<(), String> {
     let e2b_id = boxed.sandbox_id.as_str();
 
     // 3. Build the fence now (idempotent; launch-sandbox.sh checks it again)
@@ -292,7 +268,7 @@ async fn provision_and_start(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let supervisor_connect = free_local_port().map_err(|e| e.to_string())?;
+    let supervisor_connect = SocketAddr::from(([127, 0, 0, 1], 17000));
     let identity = ResolvedWorkloadIdentity::new(
         WORKLOAD_UID,
         WORKLOAD_UID,
@@ -379,83 +355,106 @@ async fn provision_and_start(
         )
         .await?;
 
-    // Local state for this sandbox: supervisor papers (0600) and sockets.
-    let dir = cfg.state_dir.join(&sandbox.id);
-    private_dir(&dir)?;
-    private_dir(&dir.join("proxy-tls"))?;
+    // All task-specific supervisor state is written into A, never the control VM.
+    let supervisor_id = &supervisor_box.sandbox_id;
+    cfg.e2b
+        .run_ok(
+            supervisor_id,
+            "install -d -m 0700 /run/openshell-task /run/openshell-task/proxy-tls /sandbox",
+            "root",
+        )
+        .await?;
     let descriptor = papers
         .runtime_descriptor
         .backend_descriptor()
         .map_err(|e| e.to_string())?;
-    let descriptor_path = dir.join("runtime-descriptor.json");
-    write_private(&descriptor_path, &descriptor.payload).await?;
-    let auth_path = dir.join("auth.json");
     let auth_bundle = serde_json::to_vec(&auth.supervisor).map_err(|e| e.to_string())?;
-    write_private(&auth_path, &auth_bundle).await?;
-
-    // 8. Tunnel 2, local end. The traffic token rides in a header only we have.
-    //    10 s heartbeat: E2B's proxy drops silent connections after about a minute.
-    let wstunnel = Command::new(&cfg.wstunnel_bin)
-        .args([
-            "client",
-            "-L",
-            &format!("tcp://{supervisor_connect}:127.0.0.1:{SOCAT_PORT}"),
-            "--http-upgrade-path-prefix",
-            &path_secret,
-            "-H",
-            &format!("e2b-traffic-access-token: {}", boxed.traffic_access_token),
-            "--websocket-ping-frequency",
-            "10s",
-            // Verify E2B's TLS certificate. wstunnel skips this by default,
-            // which would let an interceptor capture the token and path.
-            "--tls-verify-certificate",
-            &format!("wss://{}", boxed.host9000),
-        ])
-        .stdout(std::fs::File::create(dir.join("wstunnel.log")).map_err(|e| e.to_string())?)
-        .stderr(std::fs::File::create(dir.join("wstunnel.err.log")).map_err(|e| e.to_string())?)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("start wstunnel client: {e}"))?;
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-    // 9. NVIDIA's supervisor: policy engine + egress proxy for this sandbox.
+    for (name, bytes) in [
+        ("runtime-descriptor.json", descriptor.payload),
+        ("auth.json", auth_bundle),
+        (
+            "gateway-ca.crt",
+            tokio::fs::read(&cfg.gateway_ca)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+        (
+            "gateway-client.crt",
+            tokio::fs::read(&cfg.gateway_cert)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+        (
+            "gateway-client.key",
+            tokio::fs::read(&cfg.gateway_key)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+    ] {
+        cfg.e2b
+            .write(
+                supervisor_id,
+                &format!("{DIR}/{name}"),
+                &bytes,
+                "root",
+                Some(0o600),
+            )
+            .await?;
+    }
+    let gateway: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(&cfg.gateway_tunnel)
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("gateway tunnel config: {e}"))?;
     let main_process_spec = env::MainProcessConfig::encode_driver_spec(sandbox.spec.as_ref())
         .map_err(|e| e.to_string())?;
-    let supervisor = Command::new(&cfg.supervisor_bin)
-        .arg("--backend-descriptor-file")
-        .arg(&descriptor_path)
-        .arg("--auth-bundle-file")
-        .arg(&auth_path)
-        .args(["--workdir", "/sandbox"])
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env(
+    let environment = HashMap::from([
+        ("PATH", "/usr/local/bin:/usr/bin:/bin".to_owned()),
+        (
             env::ADMITTED_ISOLATION_BACKEND,
-            openshell_sandbox_backend::BACKEND_NAME,
-        )
-        .env(env::MAIN_PROCESS_SPEC, main_process_spec)
-        .env(env::ENDPOINT, &cfg.gateway_endpoint)
-        .env(env::SANDBOX_ID, &sandbox.id)
-        .env(env::SANDBOX, &sandbox.name)
-        .env(env::SSH_SOCKET_PATH, dir.join("ssh.sock"))
-        .env(env::PROXY_TLS_DIR, dir.join("proxy-tls"))
-        .env(
+            openshell_sandbox_backend::BACKEND_NAME.to_owned(),
+        ),
+        (env::MAIN_PROCESS_SPEC, main_process_spec),
+        (env::ENDPOINT, cfg.gateway_endpoint.clone()),
+        (env::SANDBOX_ID, sandbox.id.clone()),
+        (env::SANDBOX, sandbox.name.clone()),
+        (env::SSH_SOCKET_PATH, format!("{DIR}/ssh.sock")),
+        (env::PROXY_TLS_DIR, format!("{DIR}/proxy-tls")),
+        (
             env::NETWORK_RUNTIME_CAPABILITIES,
-            env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY,
+            env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_owned(),
+        ),
+        (env::LOG_LEVEL, "info".to_owned()),
+        (env::TELEMETRY_ENABLED, "false".to_owned()),
+        (env::TLS_CA, format!("{DIR}/gateway-ca.crt")),
+        (env::TLS_CERT, format!("{DIR}/gateway-client.crt")),
+        (env::TLS_KEY, format!("{DIR}/gateway-client.key")),
+    ]);
+    let config = serde_json::json!({
+        "worker": {"host": boxed.host9000, "token": boxed.traffic_access_token, "path": path_secret},
+        "gateway": gateway,
+        "environment": environment,
+    });
+    cfg.e2b
+        .write(
+            supervisor_id,
+            &format!("{DIR}/config.json"),
+            &serde_json::to_vec(&config).map_err(|e| e.to_string())?,
+            "root",
+            Some(0o600),
         )
-        .env(env::LOG_LEVEL, "info")
-        .env(env::TELEMETRY_ENABLED, "false")
-        .env(env::TLS_CA, &cfg.gateway_ca)
-        .env(env::TLS_CERT, &cfg.gateway_cert)
-        .env(env::TLS_KEY, &cfg.gateway_key)
-        .stdout(std::fs::File::create(dir.join("supervisor.log")).map_err(|e| e.to_string())?)
-        .stderr(std::fs::File::create(dir.join("supervisor.err.log")).map_err(|e| e.to_string())?)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("start supervisor: {e}"))?;
-    info!(sandbox = %sandbox.name, e2b = %e2b_id, port = %supervisor_connect, "supervisor started");
-
-    Ok(vec![wstunnel, supervisor])
+        .await?;
+    cfg.e2b
+        .run_background(
+            supervisor_id,
+            "exec /opt/openshell/launch-supervisor.py > /run/openshell-task/launcher.log 2>&1",
+            "root",
+        )
+        .await?;
+    cfg.e2b.run_ok(supervisor_id, "for i in $(seq 100); do test -f /run/openshell-task/ready && exit 0; test -f /run/openshell-task/failed && exit 1; sleep 0.2; done; exit 1", "root").await?;
+    info!(sandbox = %sandbox.name, worker = %e2b_id, supervisor = %supervisor_id, "separate supervisor started");
+    Ok(())
 }
 
 /// User environment for the agent, minus names `OpenShell` reserves for itself
@@ -474,20 +473,20 @@ fn child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> {
     vars
 }
 
-/// Stop the local processes and kill the E2B box. Returns an error if E2B
-/// didn't confirm, so the caller keeps the record and the delete can be retried.
+/// Attempt both deletes even if one fails. Retain the record for safe retry.
 pub async fn delete(
     cfg: &Config,
     sandbox_id: &str,
-    e2b_id: &str,
-    mut children: Vec<Child>,
+    worker: &str,
+    supervisor: &str,
 ) -> Result<(), String> {
-    for child in &mut children {
-        let _ = child.kill().await;
+    let results: [Result<(), String>; 2] =
+        tokio::join!(cfg.e2b.kill(supervisor), cfg.e2b.kill(worker)).into();
+    let failures: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+    if !failures.is_empty() {
+        return Err(failures.join("; "));
     }
-    cfg.e2b.kill(e2b_id).await?;
-    let _ = tokio::fs::remove_dir_all(cfg.state_dir.join(sandbox_id)).await;
-    info!(sandbox_id, e2b = %e2b_id, "deleted");
+    info!(sandbox_id, worker, supervisor, "task pair deleted");
     Ok(())
 }
 
@@ -574,5 +573,75 @@ mod tests {
         assert!(private_dir(&link).is_err_and(|e| e.contains("not a directory")));
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&target);
+    }
+    fn fake_config(
+        name: &str,
+    ) -> Result<(super::Config, std::path::PathBuf), Box<dyn std::error::Error>> {
+        let dir = scratch(name);
+        std::fs::create_dir(&dir)?;
+        let helper = dir.join("helper.py");
+        std::fs::write(
+            &helper,
+            r#"
+import json, pathlib, sys
+req = json.load(sys.stdin)
+root = pathlib.Path(__file__).parent
+with (root / 'calls.jsonl').open('a') as f:
+    f.write(json.dumps({'op': sys.argv[1], **req}) + '\n')
+if req.get('sandboxId') == 'unreachable':
+    print(json.dumps({'ok': False, 'error': 'injected API failure'}))
+else:
+    print(json.dumps({'ok': True, 'killed': True}))
+"#,
+        )?;
+        let cfg = super::Config {
+            template: "worker".into(),
+            supervisor_template: "supervisor".into(),
+            e2b: crate::e2b::E2b {
+                node: "python3".into(),
+                helper,
+            },
+            gateway_tunnel: dir.join("gateway.json"),
+            gateway_endpoint: "https://localhost:17670".into(),
+            gateway_ca: dir.join("ca"),
+            gateway_cert: dir.join("cert"),
+            gateway_key: dir.join("key"),
+            owner: "test-owner".into(),
+        };
+        Ok((cfg, dir))
+    }
+
+    #[tokio::test]
+    async fn delete_attempts_worker_even_when_supervisor_delete_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("delete-pair")?;
+        assert!(
+            super::delete(&cfg, "task", "worker", "unreachable")
+                .await
+                .is_err()
+        );
+        let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
+        assert_eq!(calls.lines().count(), 2);
+        assert!(calls.contains("worker") && calls.contains("unreachable"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_tracks_only_failed_deletes_for_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("rollback-pair")?;
+        let result =
+            super::rollback(&cfg, "provision failed".into(), &["unreachable", "worker"]).await;
+        assert_eq!(result.message, "provision failed");
+        assert_eq!(result.leaked_boxes, vec!["unreachable"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("calls.jsonl"))?
+                .lines()
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

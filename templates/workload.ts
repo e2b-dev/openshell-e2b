@@ -27,7 +27,7 @@ export const template = Template({ fileContextPath: process.cwd() })
     'install -d -m 0700 -o 1500 -g 1500 /.openshell/channel/sandbox /sandbox',
   ], { user: 'root' })
 
-Template.build(template, 'openshell-workload', {
+Template.build(template, 'openshell-workload-separated', {
   cpuCount: 2,
   memoryMB: 2048,
   onBuildLogs: defaultBuildLogger(),

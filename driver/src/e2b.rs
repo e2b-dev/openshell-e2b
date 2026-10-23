@@ -18,7 +18,7 @@ pub struct E2b {
     pub helper: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Created {
     pub sandbox_id: String,
@@ -69,10 +69,15 @@ impl E2b {
     }
 
     /// Create a private sandbox from `template`, tagged with `metadata`.
-    pub async fn create(&self, template: &str, metadata: Value) -> Result<Created, String> {
+    pub async fn create(
+        &self,
+        template: &str,
+        metadata: Value,
+        allow_internet: bool,
+    ) -> Result<Created, String> {
         self.call(
             "create",
-            json!({ "template": template, "metadata": metadata, "timeoutMs": 3_600_000 }),
+            json!({ "template": template, "metadata": metadata, "timeoutMs": 3_600_000, "allowInternetAccess": allow_internet }),
         )
         .await
     }
