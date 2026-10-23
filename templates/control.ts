@@ -14,7 +14,7 @@
 import { Template, defaultBuildLogger } from 'e2b'
 
 const TAG = process.env.OPENSHELL_TAG ?? 'v0.1.2'
-const NODE = 'v24.21.0'
+const NODE = 'v24.22.1'
 const RELEASE = `https://github.com/NVIDIA/OpenShell/releases/download/${TAG}`
 const WSTUNNEL = 'https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz'
 const ROOT = '/opt/openshell-e2b'
