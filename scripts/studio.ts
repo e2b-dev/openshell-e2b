@@ -4,9 +4,9 @@ import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { appendFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { Sandbox, CommandExitError } from 'e2b'
+import { Sandbox, CommandExitError, SandboxNotFoundError } from 'e2b'
 
-const dir = 'dist/studio'
+const dir = process.env.STUDIO_DIR || 'dist/studio'
 const file = `${dir}/state.json`
 const exec = promisify(execFile)
 const env = { ...process.env, XDG_CONFIG_HOME: `${process.cwd()}/.openshell-separated`, OPENSHELL_COLOR: 'never' }
@@ -46,7 +46,7 @@ async function create() {
   const previous = await state().catch(() => undefined)
   assert(!previous || previous.phase === 'deleted', 'A studio task already exists. Run studio cleanup first.')
   await os(['status'])
-  const s: State = { name: `studio-${Date.now().toString(36)}`, control: (await readFile('.control-separated-id', 'utf8')).trim(), phase: 'creating', checks: [], createdAt: new Date().toISOString() }
+  const s: State = { name: `${process.env.STUDIO_NAME_PREFIX || 'studio'}-${Date.now().toString(36)}`, control: (await readFile('.control-separated-id', 'utf8')).trim(), phase: 'creating', checks: [], createdAt: new Date().toISOString() }
   await save(s)
   await writeFile(`${dir}/supervisor-events.jsonl`, '')
   console.log('Creating two private E2B microVMs…')
@@ -125,8 +125,10 @@ async function requests(s: State) {
   assert.equal(s.phase, 'ready')
   const get = (await inside(s, 'curl -sS -m 15 -o /dev/null -w "%{http_code}" https://api.github.com/zen')).trim()
   assert.equal(get, '200'); pass(s, 'curl GET  /zen    → HTTP 200')
+  if (process.env.STUDIO_DEMO_DELAY) await sleep(Number(process.env.STUDIO_DEMO_DELAY))
   const post = (await inside(s, 'curl -sS -m 15 -o /dev/null -w "%{http_code}" -X POST -d "{}" https://api.github.com/gists')).trim()
   assert.equal(post, '403'); pass(s, 'curl POST /gists  → HTTP 403')
+  if (process.env.STUDIO_DEMO_DELAY) await sleep(Number(process.env.STUDIO_DEMO_DELAY))
   const wget = await inside(s, 'command -v wget >/dev/null || exit 9; if wget -q -T 5 -t 1 -O /dev/null https://api.github.com/zen; then echo UNEXPECTED; else echo DENIED; fi')
   assert.match(wget, /DENIED/); pass(s, 'wget GET  /zen    → program denied')
   const audit = await os(['logs', s.name])
@@ -163,13 +165,18 @@ async function sever(s: State) {
 async function cleanup(s: State) {
   if (s.phase === 'deleted') return
   await os(['sandbox', 'delete', s.name]).catch(() => {})
-  for (let i = 0; i < 15; i++) {
+  // List is eventually consistent after deletion. Wait for the inventory and
+  // confirm each known VM is absent through the individual lookup as well.
+  for (let i = 0; i < 60; i++) {
     const left = await pair(s)
     if (!left.length) break
-    if (i === 10) for (const item of left) await Sandbox.kill(item.sandboxId)
+    if (i === 10 || i === 30) for (const item of left) await Sandbox.kill(item.sandboxId)
     await sleep(1_000)
   }
   assert.equal((await pair(s)).length, 0, 'Both task VMs must be gone')
+  for (const id of [s.supervisor, s.worker].filter(Boolean)) {
+    await assert.rejects(Sandbox.getInfo(id!), SandboxNotFoundError)
+  }
   pass(s, 'Both task microVMs removed')
   await os(['status']); pass(s, 'Shared control plane stays available')
   s.phase = 'deleted'; await save(s)
@@ -239,6 +246,7 @@ async function workerFeed() {
           const stopped = result.stdout.split('\n').some(row => /^T\S*\s+(sh|sleep)$/.test(row.trim()))
           screen = `${c.blue}B / ${s.worker}${c.reset}\nSeparate guest kernel · runtime + agent\n\n${stopped ? c.red : c.green}${c.bold}${stopped ? '■ AGENT FROZEN' : '● AGENT RUNNING'}${c.reset}\n\nHeartbeat   ${beat.padStart(5, '0')}  ${stopped ? 'STOPPED' : beat !== previous ? '▂ ▄ ▆ █ ▆ ▄' : '▁ ▂ ▄ ▆ ▄ ▂'}\nKernel      ${stopped ? 'T = stopped by runtime' : 'agent process active'}\nIdentity    uid 1500 · zero caps\nRoot egress ${s.rootFence ? 'DENIED · verified HTTPS probe' : 'probe pending'}\n\n${c.dim}Heartbeat and process state read live from B.${c.reset}`
           previous = beat
+          if (process.env.STUDIO_COMPACT === '1') screen = `${c.blue}B / ${s.worker}${c.reset}\n${stopped ? c.red : c.green}${c.bold}${stopped ? '■ AGENT FROZEN' : '● AGENT RUNNING'}${c.reset}\nHeartbeat  ${beat.padStart(5, '0')}  ${stopped ? 'STOPPED' : '▂ ▄ ▆ █ ▆ ▄'}\nKernel     ${stopped ? 'T = stopped by runtime' : 'agent process active'}\nIdentity   uid 1500 · zero caps\nRoot HTTPS ${s.rootFence ? 'DENIED · verified' : 'probe pending'}\n${c.dim}Read live from the worker VM${c.reset}`
         } catch { screen = `${c.amber}Worker observation unavailable; checking lifecycle…${c.reset}` }
       }
     }

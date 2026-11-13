@@ -65,6 +65,46 @@ Local state is isolated from the original demo: `.control-separated-id`, `.opens
 npm run demo:down       # deletes this control plane's task VMs and the control VM
 ```
 
+## Native OpenShell dashboard demo
+
+```bash
+cd /Users/matt/e2b/openshell-e2b
+npm run demo:dashboard
+```
+
+The upper pane is the unmodified OpenShell v0.1.2 `openshell term` UI. The lower-left pane controls the walkthrough; the lower-right pane samples the worker's real heartbeat and kernel process state through E2B. The launcher connects to the gateway automatically and isolates its state under `dist/dashboard/`.
+
+Run these commands in the lower-left pane, pausing to explain each result:
+
+```bash
+demo create       # one logical OpenShell sandbox → supervisor A + worker B
+demo links        # show task name and all three E2B IDs
+demo fence        # default deny; root HTTPS succeeds in A and fails in B
+ui policy         # from the initial dashboard, open the first sandbox
+demo policy       # allow /usr/bin/curl read-only access to api.github.com
+ui logs           # from policy, open native logs filtered to sandbox events
+demo requests     # curl GET 200, curl POST 403, wget denied
+ui audit          # scroll up one page to inspect the request decisions
+ui follow         # resume following all events
+demo sever        # destroy this task's supervisor; observe the worker freeze
+demo cleanup      # remove the task pair; verify the shared gateway survives
+```
+
+For manual navigation, click the upper pane. On the dashboard, Tab switches panels and Enter opens a selected sandbox. In a sandbox, `l` opens logs; `s` cycles the log source; `f` follows; Page Up scrolls; Enter expands a selected event; Esc returns. Click the lower-left pane before running the next command. The `ui` shortcuts assume the sequence above and that the demo is the first sandbox; with other tasks present, select the printed task name manually.
+
+Keep your signed-in **local browser** open to E2B Console → Sandboxes, sorted by Started at descending. After `demo create`, inspect the two new rows: `openshell-supervisor-separated` and `openshell-workload-separated`. Their metadata has the same `openshell.ai/sandbox-name` and different `openshell.ai/role` values. Open a row for E2B CPU/memory monitoring. Return to the native OpenShell view for policy and audit, then show worker B surviving supervisor loss. The Console template filter selects a single template; use the unfiltered list to show both roles together.
+
+Use a large terminal (about 140 columns × 35 rows or larger). Ctrl-B, D exits the presentation and triggers cleanup of only its task pair. The shared control VM remains available. Before presenting, check the control VM has enough time remaining: this prototype has a one-hour lifetime. To start fresh, stop the existing `npm run connect` process in its terminal, then run `npm run connect -- --new` in that terminal and leave it open.
+
+```bash
+npm run demo:record:dashboard
+# → media/openshell-dashboard-demo.mp4, 45 seconds, 1080p
+```
+
+Recording requires VHS, tmux, FFmpeg and Menlo. The tape executes the live scenario, waits for actual results, and exports only after all 14 assertions plus supervisor GET-allow and POST-deny audit records pass. The capture is accelerated; network and provisioning wait times vary. The edited `media/openshell-dashboard-console-demo.mp4` adds a six-second cutaway captured from the signed-in local Chrome Console for the same task. Console captures are manual and are not part of the unattended recorder. To pause a recording for this cutaway, use `DASHBOARD_CAPTURE=1 npm run demo:record:dashboard`; after `dist/dashboard/console-ready` appears, capture the list and run `touch dist/dashboard/console-captured` from another terminal within three minutes.
+
+Evidence is saved in `dist/dashboard/state.json` and `dist/dashboard/supervisor-events.jsonl`. The separate `demo:studio` view below keeps the raw supervisor feed visible alongside the worker.
+
 ## Three-pane live demo and video
 
 ```bash
