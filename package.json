@@ -11,12 +11,25 @@
     "sbx": "tsx --env-file=.env scripts/sbx.ts",
     "spike:tunnel": "tsx --env-file=.env spikes/tunnel.ts",
     "template:control": "tsx --env-file=.env templates/control.ts",
-    "demo": "scripts/demo.sh",
+    "demo": "tsx --env-file=.env scripts/demo-separated.ts",
     "fleet": "scripts/fleet.sh",
-    "watch": "tsx --env-file=.env scripts/watch.ts"
+    "watch": "tsx --env-file=.env scripts/watch.ts",
+    "template:supervisor": "tsx --env-file=.env templates/supervisor.ts",
+    "demo:verify": "tsx --env-file=.env scripts/demo-separated.ts --fault",
+    "typecheck": "tsc --noEmit",
+    "demo:down": "tsx --env-file=.env scripts/demo-down.ts",
+    "studio": "tsx --env-file=.env scripts/studio.ts",
+    "demo:studio": "bash scripts/studio.sh",
+    "demo:record": "bash scripts/studio.sh --record",
+    "demo:dashboard": "bash scripts/dashboard.sh",
+    "demo:record:dashboard": "bash scripts/dashboard.sh --record"
   },
   "dependencies": {
     "e2b": "^2.51.0",
     "tsx": "^4.23.15"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2"
   }
 }

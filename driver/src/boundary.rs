@@ -9,7 +9,7 @@
 //!               ┌───────────────────────┴───────────────────────┐
 //!               ▼                                               ▼
 //!      BoundaryConfig  → bootstrap.json               SandboxRuntimeDescriptor → runtime-descriptor.json
-//!      read by openshell-sandbox (agent box)          read by openshell-supervisor (control box)
+//!      read by openshell-sandbox (agent box)          read by openshell-supervisor (separate supervisor box)
 //!      "listen on control.sock with this TLS cert,    "connect to 127.0.0.1:<port>, trust only
 //!       accept only this gateway's keys"               this session's CA, expect this fence"
 //!
@@ -43,6 +43,7 @@ struct E2bOuterFenceEvidence<'a> {
     network_namespace: &'static str,
     fenced_interfaces: &'a [String],
     public_traffic: bool,
+    host_egress: &'static str,
 }
 
 impl E2bOuterFenceEvidence<'_> {
@@ -85,7 +86,7 @@ pub struct E2bBoundarySpec {
     pub e2b_sandbox_id: String,
     pub template: String,
     pub fenced_interfaces: Vec<String>,
-    /// Local end of tunnel 2 in the control box; the supervisor connects here.
+    /// Local end of tunnel 2 in the supervisor box; the supervisor connects here.
     pub supervisor_connect: SocketAddr,
     pub supervisor_tls: SandboxTlsClientConfig,
     pub workload_identity: ResolvedWorkloadIdentity,
@@ -109,6 +110,7 @@ impl E2bBoundarySpec {
             network_namespace: "os",
             fenced_interfaces: &self.fenced_interfaces,
             public_traffic: false,
+            host_egress: "E2B allowInternetAccess=false",
         }
         .project(&self.generation)?;
 

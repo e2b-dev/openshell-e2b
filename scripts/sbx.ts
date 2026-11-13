@@ -16,8 +16,8 @@ if (cmd === 'create') {
   try {
     await sbx.commands.run(command.join(' '), {
       timeoutMs: 0,
-      onStdout: (d) => process.stdout.write(d),
-      onStderr: (d) => process.stderr.write(d),
+      onStdout: (d) => { process.stdout.write(d) },
+      onStderr: (d) => { process.stderr.write(d) },
     })
   } catch (e) {
     if (e instanceof CommandExitError) process.exit(e.exitCode)
