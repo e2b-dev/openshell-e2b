@@ -245,9 +245,7 @@ impl ComputeDriver for E2bDriver {
                     Ok(runtime_identity)
                 }
                 Err(error) => {
-                    if let Some(box_id) = error.leaked_box {
-                        shared.leaked.lock().await.insert(box_id);
-                    }
+                    shared.leaked.lock().await.extend(error.leaked_boxes);
                     Err(error.message)
                 }
             };
@@ -286,7 +284,7 @@ impl ComputeDriver for E2bDriver {
         let id = request.into_inner().sandbox_id;
         // Mark the record as deleting (it stays in Get/List/Watch) and take
         // what the cleanup needs. A second delete meanwhile is told to wait.
-        let (e2b_id, children) = {
+        let (e2b_id, supervisor_id) = {
             let mut table = self.sandboxes.lock().await;
             let Some(running) = table.get_mut(&id) else {
                 return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
@@ -302,17 +300,14 @@ impl ComputeDriver for E2bDriver {
                 .announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
                     sandbox: Some(running.sandbox.clone()),
                 }));
-            let parts = (
-                running.e2b_id.clone(),
-                std::mem::take(&mut running.children),
-            );
+            let parts = (running.e2b_id.clone(), running.supervisor_id.clone());
             drop(table); // announced under the lock; released right after
             parts
         };
         // Driver-owned task: cancellation of this request can't abandon it.
         let shared = self.shared.clone();
         let task = tokio::spawn(async move {
-            let result = lifecycle::delete(&shared.cfg, &id, &e2b_id, children).await;
+            let result = lifecycle::delete(&shared.cfg, &id, &e2b_id, &supervisor_id).await;
             let mut table = shared.sandboxes.lock().await;
             match &result {
                 // Only now, after E2B confirmed, the record goes away.

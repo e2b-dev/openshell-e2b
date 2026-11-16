@@ -6,14 +6,14 @@
 #   npm run fleet -- 5       5 workloads
 #   KEEP=1 npm run fleet     leave them running (then: openshell sandbox delete <name>)
 #
-#   1. create N sandboxes in parallel → N private E2B microVMs, one control box
-#   2. each is its own machine       → one E2B box per sandbox, same fence
+#   1. create N sandboxes in parallel → 2N private E2B microVMs, one control box
+#   2. each is its own machine       → one supervisor + worker pair per task, same fence
 #   3. per-sandbox policy            → only the first may read api.github.com
 #   4. enforcement per sandbox       → first GET 200, the rest denied
 #   5. delete
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export XDG_CONFIG_HOME="$PWD/.openshell"
+export XDG_CONFIG_HOME="$PWD/.openshell-separated"
 os() { .bin/openshell "$@"; }
 in_sandbox() { os sandbox exec -n "$1" --no-tty -- sh -c "$2"; }
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -44,7 +44,7 @@ done
 echo "all $COUNT Ready after $(( $(date +%s) - start ))s"
 os sandbox list | grep -E "^NAME|^$PREFIX-"
 
-step "2. each workload is its own E2B box, same fence"
+step "2. each workload gets its own supervisor and worker VMs"
 # The fence hides the E2B sandbox id from the workload, so ask the E2B API:
 # the driver tags every box with its OpenShell sandbox name.
 npx tsx --env-file=.env scripts/sbx.ts ls | grep " $PREFIX-" | awk '{print $5, "-> E2B box", $1}' | sort

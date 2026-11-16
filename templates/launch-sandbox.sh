@@ -4,7 +4,7 @@
 # Runs as root inside the agent's E2B sandbox. Called by the driver after it
 # has written /.openshell/channel/sandbox/{bootstrap.json,server.crt,server.key}.
 #
-#   E2B sandbox (root namespace, has internet)
+#   E2B sandbox (host-enforced deny-all egress, including root namespace)
 #   └── network namespace "os"          ← only a loopback interface: no route out
 #       └── PID namespace               ← openshell-sandbox is PID 1, sees nothing else
 #           └── openshell-sandbox       ← uid/gid 1500, zero capabilities, no_new_privs

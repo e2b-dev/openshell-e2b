@@ -1,0 +1,33 @@
+{
+  "verifiedAt": "2026-10-23T23:52:51.775Z",
+  "video": "media/separated-supervisor-demo.mp4",
+  "width": 1920,
+  "height": 1080,
+  "durationSeconds": 45.066667,
+  "sourceDurationSeconds": 63.72,
+  "name": "studio-mvlmheoz",
+  "control": "iveay7fm552ml9lnnpzkb",
+  "phase": "deleted",
+  "checks": [
+    "Shared control plane: gateway + driver only",
+    "Supervisor A and worker B are distinct microVMs",
+    "Worker: uid 1500, zero capabilities, no supervisor auth",
+    "OpenShell blocks GitHub before policy is added",
+    "Worker root cannot bypass the external network fence",
+    "Policy updated live; worker keeps running",
+    "curl GET  /zen    → HTTP 200",
+    "curl POST /gists  → HTTP 403",
+    "wget GET  /zen    → program denied",
+    "Allow / deny audit arrives from separate supervisor A",
+    "Worker is still alive; agent FROZEN at heartbeat 79",
+    "Root egress remains blocked after supervisor loss",
+    "Both task microVMs removed",
+    "Shared control plane stays available"
+  ],
+  "createdAt": "2026-10-23T23:50:15.971Z",
+  "supervisor": "izp5c9p5qf0ddihua8d8d",
+  "worker": "i8yxqv6k05hd4r4t41yqy",
+  "rootFence": true,
+  "frozenHeartbeat": "79",
+  "supervisorAuditRecords": 9
+}

@@ -1,7 +1,6 @@
 // openshell-control: the E2B template for the trusted control box.
 //
 //   /opt/openshell-e2b/bin/openshell-gateway     NVIDIA gateway, stock release
-//   /opt/openshell-e2b/bin/openshell-supervisor  NVIDIA supervisor, demo patch (dist/)
 //   /opt/openshell-e2b/bin/openshell-driver-e2b  our driver (dist/)
 //   /opt/openshell-e2b/bin/wstunnel              tunnel client + server
 //   /opt/openshell-e2b/node/                     Node 24 (the E2B SDK needs >= 22)
@@ -22,7 +21,6 @@ const ROOT = '/opt/openshell-e2b'
 export const template = Template({ fileContextPath: process.cwd() })
   .fromBaseImage()
   .aptInstall(['curl', 'ca-certificates', 'xz-utils', 'jq'])
-  .copy(`dist/${TAG}/openshell-supervisor`, `${ROOT}/bin/openshell-supervisor`, { mode: 0o755, user: 'root' })
   .copy(`dist/${TAG}/openshell-driver-e2b`, `${ROOT}/bin/openshell-driver-e2b`, { mode: 0o755, user: 'root' })
   .copy('driver/e2b-helper.mjs', `${ROOT}/helper/e2b-helper.mjs`, { mode: 0o644, user: 'root' })
   .runCmd([
@@ -33,7 +31,7 @@ export const template = Template({ fileContextPath: process.cwd() })
     `cd ${ROOT}/helper && echo '{"type":"module","private":true}' > package.json && PATH=${ROOT}/node/bin:$PATH npm install --silent e2b@2.51.0`,
   ], { user: 'root' })
 
-Template.build(template, 'openshell-control', {
+Template.build(template, 'openshell-control-separated', {
   cpuCount: 2,
   memoryMB: 2048,
   onBuildLogs: defaultBuildLogger(),

@@ -1,7 +1,7 @@
 // Build every Linux binary the demo needs, in an E2B builder box, into dist/<tag>/:
 //
 //   openshell-sandbox      NVIDIA's runtime, with patches/landlock-abi2.patch  (agent boxes)
-//   openshell-supervisor   NVIDIA's supervisor, same patch                      (control box)
+//   openshell-supervisor   NVIDIA's supervisor, same patch                      (supervisor box)
 //   openshell-driver-e2b   our driver, from ./driver                            (control box)
 //
 // Usage: npm run build:binaries
@@ -12,12 +12,19 @@ import { Sandbox } from 'e2b'
 const TAG = process.env.OPENSHELL_TAG ?? 'v0.1.2'
 const NVIDIA_BINS = ['openshell-sandbox', 'openshell-supervisor']
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a)
-const stream = { onStdout: (d: string) => process.stdout.write(d), onStderr: (d: string) => process.stderr.write(d) }
+const stream = { onStdout: (d: string) => { process.stdout.write(d) }, onStderr: (d: string) => { process.stderr.write(d) } }
 
 async function main() {
-  const sbx = await Sandbox.create('openshell-builder', { timeoutMs: 60 * 60_000, network: { allowPublicTraffic: false } })
+  const reuse = process.argv.includes('--reuse')
+  const driverOnly = process.argv.includes('--driver-only')
+  const sbx = reuse
+    ? await Sandbox.connect((await readFile('.builder-separated-id', 'utf8')).trim(), { timeoutMs: 60 * 60_000 })
+    : await Sandbox.create('openshell-builder', { timeoutMs: 60 * 60_000, network: { allowPublicTraffic: false } })
+  await writeFile('.builder-separated-id', sbx.sandboxId)
+  let succeeded = false
   log('builder', sbx.sandboxId)
   try {
+    if (!reuse && !driverOnly) {
     // NVIDIA's code at the pinned tag, with the demo patch applied.
     await sbx.files.write('/tmp/landlock-abi2.patch', await readFile('patches/landlock-abi2.patch', 'utf8'))
     await sbx.commands.run(
@@ -34,8 +41,10 @@ async function main() {
       { timeoutMs: 180_000, ...stream },
     )
 
-    // Our driver source (committed files only, no target/ or secrets).
-    const tar = execFileSync('git', ['archive', 'HEAD', 'driver'])
+    }
+    // Build the working branch, including edits not yet committed. Explicit
+    // source paths exclude credentials, recordings and local build outputs.
+    const tar = execFileSync('tar', ['-cf', '-', 'driver/Cargo.toml', 'driver/Cargo.lock', 'driver/src'])
     await sbx.files.write('/tmp/driver.tar', tar.buffer.slice(tar.byteOffset, tar.byteOffset + tar.byteLength) as ArrayBuffer)
     await sbx.commands.run('mkdir -p /tmp/src && tar -xf /tmp/driver.tar -C /tmp/src', { timeoutMs: 60_000 })
 
@@ -43,16 +52,16 @@ async function main() {
     // Both builds in one command, in parallel; the box has 8 cores.
     await sbx.commands.run(
       // (wait by PID: job specs like %1 need job control, absent in non-interactive shells)
-      `(cd /tmp/os && cargo build --release ${NVIDIA_BINS.map((b) => `--bin ${b}`).join(' ')}) > /tmp/os.log 2>&1 & p1=$!; ` +
-      '(cd /tmp/src/driver && cargo build --release) > /tmp/driver.log 2>&1 & p2=$!; ' +
-      'wait $p1; a=$?; wait $p2; b=$?; grep -hE "^error|Finished" /tmp/os.log /tmp/driver.log; exit $((a | b))',
+      (driverOnly ? 'true > /tmp/os.log & p1=$!; ' : `(cd /tmp/os && cargo build --release ${NVIDIA_BINS.map((b) => `--bin ${b}`).join(' ')}) > /tmp/os.log 2>&1 & p1=$!; `) +
+      '(cd /tmp/src/driver && cargo test --release && cargo build --release) > /tmp/driver.log 2>&1 & p2=$!; ' +
+      'wait $p1; a=$?; wait $p2; b=$?; grep -hE "^error|Finished|test result" /tmp/os.log /tmp/driver.log; exit $((a | b))',
       { timeoutMs: 50 * 60_000, ...stream },
     )
     log(`builds took ${Math.round((Date.now() - t0) / 1000)}s`)
 
     await mkdir(`dist/${TAG}`, { recursive: true })
     const outputs = [
-      ...NVIDIA_BINS.map((b) => [`/tmp/os/target/release/${b}`, b]),
+      ...(driverOnly ? [] : NVIDIA_BINS).map((b) => [`/tmp/os/target/release/${b}`, b]),
       ['/tmp/src/driver/target/release/openshell-driver-e2b', 'openshell-driver-e2b'],
     ]
     for (const [remote, name] of outputs) {
@@ -60,9 +69,14 @@ async function main() {
       await writeFile(`dist/${TAG}/${name}`, bytes, { mode: 0o755 })
       log(`dist/${TAG}/${name}`, `${(bytes.length / 1e6).toFixed(1)} MB`)
     }
+    succeeded = true
   } finally {
-    await sbx.kill()
-    log('builder killed')
+    if (succeeded && !process.argv.includes('--keep-builder')) {
+      await sbx.kill()
+      log('builder killed')
+    } else {
+      log('builder retained for diagnosis/rebuild:', sbx.sandboxId, '(1-hour TTL)')
+    }
   }
 }
 

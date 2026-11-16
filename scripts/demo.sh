@@ -11,7 +11,7 @@
 #   7. delete
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export XDG_CONFIG_HOME="$PWD/.openshell"
+export XDG_CONFIG_HOME="$PWD/.openshell-separated"
 os() { .bin/openshell "$@"; }
 in_sandbox() { os sandbox exec -n "$NAME" --no-tty -- sh -c "$1"; }
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }

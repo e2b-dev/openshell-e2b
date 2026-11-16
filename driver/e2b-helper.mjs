@@ -20,7 +20,7 @@
 //   extend  {sandboxId, timeoutMs}                  → {}
 //
 // Every sandbox is created private (allowPublicTraffic: false): its URLs
-// require the traffic access token, which only the driver holds.
+// require the traffic access token, which the driver delegates only to the paired supervisor.
 import { Sandbox, CommandExitError } from 'e2b'
 
 const TUNNEL_PORT = 9000
@@ -32,10 +32,11 @@ async function readStdin() {
 }
 
 const ops = {
-  async create({ template, metadata = {}, timeoutMs = 60 * 60_000 }) {
+  async create({ template, metadata = {}, timeoutMs = 60 * 60_000, allowInternetAccess = false }) {
     const sbx = await Sandbox.create(template, {
       metadata,
       timeoutMs,
+      allowInternetAccess,
       network: { allowPublicTraffic: false },
     })
     return { sandboxId: sbx.sandboxId, trafficAccessToken: sbx.trafficAccessToken, host9000: sbx.getHost(TUNNEL_PORT) }

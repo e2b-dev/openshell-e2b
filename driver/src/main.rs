@@ -61,11 +61,11 @@ struct Args {
     #[arg(long, env = "OPENSHELL_E2B_NODE", default_value = "node")]
     node: PathBuf,
 
-    /// NVIDIA's supervisor (patched build) and the tunnel client, on this machine.
-    #[arg(long, env = "OPENSHELL_E2B_SUPERVISOR")]
-    supervisor: PathBuf,
-    #[arg(long, env = "OPENSHELL_E2B_WSTUNNEL")]
-    wstunnel: PathBuf,
+    /// Dedicated per-task supervisor template and authenticated gateway tunnel.
+    #[arg(long, default_value = "openshell-supervisor-separated")]
+    supervisor_template: String,
+    #[arg(long)]
+    gateway_tunnel: PathBuf,
 
     /// How supervisors reach the gateway, and the client certificate they use.
     #[arg(
@@ -81,7 +81,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_E2B_GATEWAY_KEY")]
     gateway_key: PathBuf,
 
-    /// Per-sandbox local state (supervisor papers, logs).
+    /// Private control-plane state directory.
     #[arg(
         long,
         env = "OPENSHELL_E2B_STATE_DIR",
@@ -113,23 +113,32 @@ async fn main() -> Result<()> {
     // Serve NVIDIA's ComputeDriver gRPC interface (defined in their
     // compute_driver.proto) with our implementation in service.rs.
     // Runs until SIGINT or SIGTERM. On either, the server stops and the
-    // sandbox table is dropped, which kills local supervisors and tunnels.
+    // shutdown kills both members of every tracked task pair.
     let config = lifecycle::Config {
         template: args.template,
         e2b: e2b::E2b {
             node: args.node,
             helper: args.helper,
         },
-        supervisor_bin: args.supervisor,
-        wstunnel_bin: args.wstunnel,
+        supervisor_template: args.supervisor_template,
+        gateway_tunnel: args.gateway_tunnel,
         gateway_endpoint: args.gateway_endpoint,
         gateway_ca: args.gateway_ca,
         gateway_cert: args.gateway_cert,
         gateway_key: args.gateway_key,
-        state_dir: args.state_dir,
         owner: args.owner,
     };
 
+    // In-memory demo state cannot adopt old sessions. Reap only this control
+    // plane's task VMs on restart; metadata prevents touching another gateway.
+    for id in config
+        .e2b
+        .list_ids(&config.owner)
+        .await
+        .map_err(|e| miette::miette!(e))?
+    {
+        config.e2b.kill(&id).await.map_err(|e| miette::miette!(e))?;
+    }
     let driver = service::E2bDriver::new(config);
     let shared = driver.shared();
     let server = tonic::transport::Server::builder()
@@ -151,18 +160,17 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Stop every local helper process and kill every E2B box this driver owns.
+/// Kill both members of every task pair this driver owns.
 /// State is in memory only, so boxes left behind would be orphans.
 async fn shutdown(shared: service::Shared) {
     let running: Vec<_> = shared.sandboxes.lock().await.drain().collect();
     let leaked: Vec<_> = shared.leaked.lock().await.drain().collect();
     let mut kills = Vec::new();
-    for (_, mut sandbox) in running {
-        for child in &mut sandbox.children {
-            let _ = child.start_kill();
+    for (_, sandbox) in running {
+        for id in [sandbox.supervisor_id, sandbox.e2b_id] {
+            let e2b = shared.cfg.e2b.clone();
+            kills.push(tokio::spawn(async move { e2b.kill(&id).await }));
         }
-        let e2b = shared.cfg.e2b.clone();
-        kills.push(tokio::spawn(async move { e2b.kill(&sandbox.e2b_id).await }));
     }
     for box_id in leaked {
         let e2b = shared.cfg.e2b.clone();
