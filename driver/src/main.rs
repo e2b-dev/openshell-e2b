@@ -156,11 +156,29 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Kill both members of every task pair this driver owns.
-/// State is in memory only, so boxes left behind would be orphans.
+/// Kill both members of every task pair this driver owns, and cancel creates
+/// in flight. State is in memory only, so VMs left behind would be orphans.
 async fn shutdown(shared: service::Shared) {
+    // Refuse new creates (existing gateway connections outlive the server
+    // future), then cancel the ones in flight; they roll back, waited below.
+    let in_flight: Vec<_> = {
+        let pending = shared.pending.lock().await;
+        shared
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        pending
+            .values()
+            .map(service::PendingCreate::cancel)
+            .collect()
+    };
     let running: Vec<_> = shared.sandboxes.lock().await.drain().collect();
-    let leaked: Vec<_> = shared.leaked.lock().await.drain().collect();
+    let leaked: Vec<_> = shared
+        .leaked
+        .lock()
+        .await
+        .drain()
+        .map(|(vm, _)| vm)
+        .collect();
     let mut kills = Vec::new();
     for (_, sandbox) in running {
         for id in [sandbox.supervisor_id, sandbox.e2b_id] {
@@ -174,6 +192,13 @@ async fn shutdown(shared: service::Shared) {
     }
     for kill in kills {
         let _ = kill.await;
+    }
+    // Bounded by the caller's timeout. Whatever is still allocated after it
+    // carries this driver's owner tag and is reaped on the next start.
+    for done in in_flight {
+        if let Err(error) = service::wait_cancelled(done).await {
+            tracing::warn!(%error, "a cancelled create left VMs behind");
+        }
     }
 }
 
