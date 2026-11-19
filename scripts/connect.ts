@@ -17,6 +17,7 @@
 //   2. wstunnel only accepts our random path and only forwards to the gateway port
 //   3. the tunnel client verifies E2B's TLS certificate (otherwise 1 and 2 could be intercepted)
 //   4. inside the tunnel, the CLI and gateway speak mutual TLS end to end
+//      (supervisors use the same tunnel server with server-verified TLS + their launch JWT)
 //
 // Keeps running (it holds the tunnel open). Ctrl-C to stop; the control box keeps running.
 // Note: on a team with a 1-hour sandbox cap the control box dies an hour after creation;
@@ -26,6 +27,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Sandbox } from 'e2b'
+import { TEMPLATES } from './openshell.ts'
 
 const GATEWAY_PORT = 17670 // gateway inside the control box (localhost only)
 const TUNNEL_PORT = 9000 // the only port we use through E2B's proxy
@@ -51,7 +53,7 @@ async function controlBox(): Promise<Sandbox> {
       }
     }
   }
-  const sbx = await Sandbox.create('openshell-control-separated', {
+  const sbx = await Sandbox.create(TEMPLATES.control, {
     timeoutMs: 60 * 60_000,
     network: { allowPublicTraffic: false },
     metadata: { 'openshell.ai/role': 'control-plane' },
@@ -80,24 +82,43 @@ async function main() {
     )
     log('control box: PKI generated')
   }
-  if (!(await exists(`${STATE}/gateway.toml`))) {
-    // [gateway_jwt] lets the gateway mint launch credentials (without it
-    // CreateSandbox arrives with no launch_authentication).
-    // ttl_secs = 3600: sandbox tokens expire and get renewed, never "forever".
-    await sbx.files.write(`${STATE}/gateway.toml`, [
-      '[openshell]',
-      'version = 2',
-      '',
-      '[openshell.gateway.gateway_jwt]',
-      `signing_key_path = "${STATE}/pki/jwt/signing.pem"`,
-      `public_key_path  = "${STATE}/pki/jwt/public.pem"`,
-      `kid_path         = "${STATE}/pki/jwt/kid"`,
-      'gateway_id       = "openshell-e2b"',
-      'ttl_secs         = 3600',
-      '',
-    ].join('\n'))
-    log('control box: gateway config written')
-  }
+  // Gateway config, schema version 2. Rewritten on every connect so a control
+  // VM always runs the config this checkout expects.
+  //   [openshell.gateway.tls]   laptop CLI and supervisors reach the gateway over TLS.
+  //                             client_ca_path makes client certificates optional
+  //                             but verified: the CLI presents one, supervisors
+  //                             authenticate with their launch JWT instead.
+  //   [openshell.gateway.mtls_auth]    a valid CLI certificate = a gateway user.
+  //   [openshell.gateway.gateway_jwt]  mints launch credentials; without it
+  //                             CreateSandbox arrives with no launch_authentication.
+  //   [openshell.drivers.e2b]   our external compute driver's socket.
+  await sbx.files.write(`${STATE}/gateway.toml`, [
+    '[openshell]',
+    'version = 2',
+    '',
+    '[openshell.gateway]',
+    `bind_address   = "127.0.0.1:${GATEWAY_PORT}"`,
+    'compute_driver = "e2b"',
+    '',
+    '[openshell.gateway.tls]',
+    `cert_path      = "${STATE}/pki/server/tls.crt"`,
+    `key_path       = "${STATE}/pki/server/tls.key"`,
+    `client_ca_path = "${STATE}/pki/ca.crt"`,
+    '',
+    '[openshell.gateway.mtls_auth]',
+    'enabled = true',
+    '',
+    '[openshell.gateway.gateway_jwt]',
+    `signing_key_path = "${STATE}/pki/jwt/signing.pem"`,
+    `public_key_path  = "${STATE}/pki/jwt/public.pem"`,
+    `kid_path         = "${STATE}/pki/jwt/kid"`,
+    'gateway_id       = "openshell-e2b"',
+    'ttl_secs         = 3600',
+    '',
+    '[openshell.drivers.e2b]',
+    `socket_path = "${STATE}/run/e2b.sock"`,
+    '',
+  ].join('\n'))
   if (!(await exists(`${STATE}/driver.env`))) {
     const lines = (await readFile('.env', 'utf8')).split('\n')
     const key = lines.find((l) => l.startsWith('E2B_API_KEY='))
@@ -148,17 +169,13 @@ async function main() {
     `--restrict-http-upgrade-path-prefix ${pathSecret}`, restart)
   await daemon('driver',
     `sh -c 'set -a; . ${STATE}/driver.env; set +a; exec ${ROOT}/bin/openshell-driver-e2b ` +
-    `--bind-socket ${STATE}/run/e2b.sock --template openshell-workload-separated ` +
-    `--supervisor-template openshell-supervisor-separated --owner ${sbx.sandboxId} ` +
-    `--helper ${ROOT}/helper/e2b-helper.mjs --node ${ROOT}/node/bin/node ` +
+    `--bind-socket ${STATE}/run/e2b.sock --template ${TEMPLATES.workload} ` +
+    `--supervisor-template ${TEMPLATES.supervisor} --owner ${sbx.sandboxId} ` +
+    `--helper ${ROOT}/helper/e2b-helper.ts --node ${ROOT}/node/bin/node ` +
     `--gateway-tunnel ${STATE}/gateway-tunnel.json --state-dir ${STATE}/sandboxes ` +
-    `--gateway-ca ${STATE}/pki/ca.crt --gateway-cert ${STATE}/pki/client/tls.crt --gateway-key ${STATE}/pki/client/tls.key'`,
+    `--gateway-ca ${STATE}/pki/ca.crt'`,
     restart)
-  await daemon('gateway',
-    `${ROOT}/bin/openshell-gateway --config ${STATE}/gateway.toml ` +
-    `--tls-cert ${STATE}/pki/server/tls.crt --tls-key ${STATE}/pki/server/tls.key --tls-client-ca ${STATE}/pki/ca.crt ` +
-    `--enable-mtls-auth true --compute-driver e2b --compute-driver-socket ${STATE}/run/e2b.sock`,
-    restart)
+  await daemon('gateway', `${ROOT}/bin/openshell-gateway --config ${STATE}/gateway.toml`, restart)
 
   // `gateway add --local` requires the client certificates to exist already.
   const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`

@@ -4,7 +4,7 @@
 #   wstunnel    tunnel client used by scripts/connect.ts
 set -euo pipefail
 cd "$(dirname "$0")/.."
-OPENSHELL_TAG="${OPENSHELL_TAG:-v0.1.2}"
+OPENSHELL_TAG="$(cat OPENSHELL_VERSION)"
 WSTUNNEL_VERSION="11.0.0"
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)  os_target=aarch64-apple-darwin;      ws_target=darwin_arm64 ;;

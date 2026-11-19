@@ -10,8 +10,9 @@
 //!   openshell-gateway  ──(gRPC over a Unix socket)──►  openshell-driver-e2b  ──►  E2B API
 //!        NVIDIA                                              ours
 //!
-//! The gateway is started with:
-//!   --compute-driver e2b --compute-driver-socket <path to our socket>
+//! The gateway selects it in `gateway.toml` (schema version 2):
+//!   `[openshell.gateway]`      `compute_driver = "e2b"`
+//!   `[openshell.drivers.e2b]`  `socket_path = "<path to our socket>"`
 //! and connects to the socket this program creates.
 //!
 //! WHY A UNIX SOCKET
@@ -67,7 +68,8 @@ struct Args {
     #[arg(long)]
     gateway_tunnel: PathBuf,
 
-    /// How supervisors reach the gateway, and the client certificate they use.
+    /// How supervisors reach the gateway, and the CA that signed its
+    /// certificate. Supervisors authenticate with their launch JWT.
     #[arg(
         long,
         env = "OPENSHELL_E2B_GATEWAY",
@@ -76,10 +78,6 @@ struct Args {
     gateway_endpoint: String,
     #[arg(long, env = "OPENSHELL_E2B_GATEWAY_CA")]
     gateway_ca: PathBuf,
-    #[arg(long, env = "OPENSHELL_E2B_GATEWAY_CERT")]
-    gateway_cert: PathBuf,
-    #[arg(long, env = "OPENSHELL_E2B_GATEWAY_KEY")]
-    gateway_key: PathBuf,
 
     /// Private control-plane state directory.
     #[arg(
@@ -124,8 +122,6 @@ async fn main() -> Result<()> {
         gateway_tunnel: args.gateway_tunnel,
         gateway_endpoint: args.gateway_endpoint,
         gateway_ca: args.gateway_ca,
-        gateway_cert: args.gateway_cert,
-        gateway_key: args.gateway_key,
         owner: args.owner,
     };
 

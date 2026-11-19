@@ -1,7 +1,13 @@
-//! One task = a supervisor microVM plus a worker microVM.
-//! The shared gateway/driver owns both lifecycles; no task processes run here.
-//! E2B denies worker egress outside the guest. `OpenShell` keeps its runtime
-//! fence and session-authenticated channel inside that boundary.
+//! One task = a supervisor microVM (A) plus a worker microVM (B).
+//!
+//! The shared gateway and this driver own both lifecycles; no task process runs
+//! in the control VM. E2B denies B all egress outside the guest. `OpenShell`
+//! keeps its runtime fence and session-authenticated channel inside that.
+//!
+//!   A: supervisor ── listens 127.0.0.1:17000 ◄── wstunnel client ══ wss ══╗
+//!      wstunnel client ══ wss ══► control VM :9000 → gateway             ║
+//!   B: wstunnel server :9000 (reverse, one Unix socket only) ◄════════════╝
+//!      └─ control.sock ◄── openshell-sandbox dials (runtime-initiated)
 
 use crate::boundary::{self, E2bBoundarySpec};
 use crate::e2b::E2b;
@@ -14,17 +20,17 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use rand::RngCore;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
 const WORKLOAD_UID: u32 = 1500;
-/// Port inside the agent box that E2B's proxy exposes (tunnel server).
+/// Port inside the worker VM that E2B's proxy exposes (tunnel server).
 const TUNNEL_PORT: u16 = 9000;
-/// socat inside the agent box: TCP 127.0.0.1:7000 → control.sock.
-const SOCAT_PORT: u16 = 7000;
+/// Task state in the supervisor VM.
 const DIR: &str = "/run/openshell-task";
+/// wstunnel restriction file in the worker VM.
+const TUNNEL_RULES: &str = "/run/openshell-tunnel.yaml";
 
 /// Everything the driver needs to know about its surroundings.
 #[derive(Clone, Debug)]
@@ -34,10 +40,10 @@ pub struct Config {
     pub supervisor_template: String,
     pub gateway_tunnel: PathBuf,
     pub gateway_endpoint: String,
-    /// Client cert the supervisor uses to reach the gateway with mutual TLS.
+    /// CA that signed the gateway's server certificate. Supervisors verify the
+    /// gateway with it and authenticate with their own launch JWT; they hold
+    /// no client certificate.
     pub gateway_ca: PathBuf,
-    pub gateway_cert: PathBuf,
-    pub gateway_key: PathBuf,
     pub owner: String,
 }
 
@@ -268,7 +274,6 @@ async fn provision_and_start(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let supervisor_connect = SocketAddr::from(([127, 0, 0, 1], 17000));
     let identity = ResolvedWorkloadIdentity::new(
         WORKLOAD_UID,
         WORKLOAD_UID,
@@ -288,7 +293,6 @@ async fn provision_and_start(
         e2b_sandbox_id: e2b_id.to_string(),
         template: cfg.template.clone(),
         fenced_interfaces,
-        supervisor_connect,
         supervisor_tls: SandboxTlsClientConfig {
             server_name: tls.server_name.clone(),
             trust_anchor_pem: tls.trust_anchor_pem.clone(),
@@ -330,17 +334,20 @@ async fn provision_and_start(
         )
         .await?;
 
-    // 7. Tunnel 2, server side. socat turns the Unix socket into a local TCP
-    //    port; wstunnel exposes only that port, only on a random path.
+    // 7. The worker side of the control channel. The supervisor VM opens a
+    //    reverse tunnel to this server; the server then listens on
+    //    control.sock, which the runtime dials. Only that one reverse Unix
+    //    socket, only behind the random path. Runs as uid 1500 so the socket
+    //    it creates belongs to the runtime's user.
     let path_secret = random_hex(16);
+    let rules = tunnel_rules(&path_secret);
     cfg.e2b
-        .run_background(
+        .write(e2b_id, TUNNEL_RULES, rules.as_bytes(), "root", Some(0o600))
+        .await?;
+    cfg.e2b
+        .run_ok(
             e2b_id,
-            &format!(
-                "for i in $(seq 50); do [ -S {sock} ] && break; sleep 0.2; done; [ -S {sock} ] || exit 1; \
-                 exec socat TCP-LISTEN:{SOCAT_PORT},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{sock} > /tmp/socat.log 2>&1",
-                sock = boundary::CONTROL_SOCKET_PATH
-            ),
+            &format!("chown {WORKLOAD_UID}:{WORKLOAD_UID} {TUNNEL_RULES}"),
             "root",
         )
         .await?;
@@ -348,8 +355,20 @@ async fn provision_and_start(
         .run_background(
             e2b_id,
             &format!(
-                "exec /opt/openshell/wstunnel server ws://0.0.0.0:{TUNNEL_PORT} --restrict-to 127.0.0.1:{SOCAT_PORT} \
-                 --restrict-http-upgrade-path-prefix {path_secret} > /tmp/wstunnel.log 2>&1"
+                "exec setpriv --reuid={WORKLOAD_UID} --regid={WORKLOAD_UID} --clear-groups --no-new-privs \
+                 /opt/openshell/wstunnel server ws://0.0.0.0:{TUNNEL_PORT} --restrict-config {TUNNEL_RULES} \
+                 > /tmp/wstunnel.log 2>&1"
+            ),
+            "root",
+        )
+        .await?;
+    // It runs in the background: confirm it is up (a bad rules file exits it).
+    cfg.e2b
+        .run_ok(
+            e2b_id,
+            &format!(
+                "for i in $(seq 50); do ss -ltn | grep -q ':{TUNNEL_PORT} ' && exit 0; sleep 0.2; done; \
+                 tail -5 /tmp/wstunnel.log >&2; exit 1"
             ),
             "root",
         )
@@ -375,18 +394,6 @@ async fn provision_and_start(
         (
             "gateway-ca.crt",
             tokio::fs::read(&cfg.gateway_ca)
-                .await
-                .map_err(|e| e.to_string())?,
-        ),
-        (
-            "gateway-client.crt",
-            tokio::fs::read(&cfg.gateway_cert)
-                .await
-                .map_err(|e| e.to_string())?,
-        ),
-        (
-            "gateway-client.key",
-            tokio::fs::read(&cfg.gateway_key)
                 .await
                 .map_err(|e| e.to_string())?,
         ),
@@ -428,11 +435,15 @@ async fn provision_and_start(
         (env::LOG_LEVEL, "info".to_owned()),
         (env::TELEMETRY_ENABLED, "false".to_owned()),
         (env::TLS_CA, format!("{DIR}/gateway-ca.crt")),
-        (env::TLS_CERT, format!("{DIR}/gateway-client.crt")),
-        (env::TLS_KEY, format!("{DIR}/gateway-client.key")),
     ]);
     let config = serde_json::json!({
-        "worker": {"host": boxed.host9000, "token": boxed.traffic_access_token, "path": path_secret},
+        "worker": {
+            "host": boxed.host9000,
+            "token": boxed.traffic_access_token,
+            "path": path_secret,
+            "socket": boundary::CONTROL_SOCKET_PATH,
+            "listen": boundary::SUPERVISOR_LISTEN.to_string(),
+        },
         "gateway": gateway,
         "environment": environment,
     });
@@ -452,9 +463,29 @@ async fn provision_and_start(
             "root",
         )
         .await?;
-    cfg.e2b.run_ok(supervisor_id, "for i in $(seq 100); do test -f /run/openshell-task/ready && exit 0; test -f /run/openshell-task/failed && exit 1; sleep 0.2; done; exit 1", "root").await?;
+    cfg.e2b.run_ok(supervisor_id, "for i in $(seq 300); do test -f /run/openshell-task/ready && exit 0; test -f /run/openshell-task/failed && exit 1; sleep 0.2; done; exit 1", "root").await?;
     info!(sandbox = %sandbox.name, worker = %e2b_id, supervisor = %supervisor_id, "separate supervisor started");
     Ok(())
+}
+
+/// wstunnel server rules for the worker VM: deny everything except one
+/// reverse tunnel that listens on the runtime's control socket, and only for
+/// clients that know this task's random path.
+fn tunnel_rules(path_secret: &str) -> String {
+    let socket = boundary::CONTROL_SOCKET_PATH.replace('.', "\\.");
+    [
+        "restrictions:".to_owned(),
+        "  - name: openshell-control".to_owned(),
+        "    match:".to_owned(),
+        // Single-quoted YAML: backslashes in the regex stay literal.
+        format!("      - !PathPrefix '^{path_secret}$'"),
+        "    allow:".to_owned(),
+        "      - !ReverseTunnel".to_owned(),
+        "        protocol: [Unix]".to_owned(),
+        format!("        unix_path: '^{socket}$'"),
+        String::new(),
+    ]
+    .join("\n")
 }
 
 /// User environment for the agent, minus names `OpenShell` reserves for itself
@@ -495,6 +526,15 @@ pub async fn delete(
 /// as uid/gid 1500, without user namespaces.
 pub fn check_supported(cfg: &Config, sandbox: &DriverSandbox) -> Result<(), String> {
     check_identity(sandbox)?;
+    // We do not advertise `openshell.compute.isolation-backend`; never fall
+    // back to the built-in runtime when an operator selected another one.
+    if sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|s| s.isolation_backend.is_some())
+    {
+        return Err("external isolation backends are not supported by the e2b driver".into());
+    }
     let Some(template) = sandbox.spec.as_ref().and_then(|s| s.template.as_ref()) else {
         return Ok(());
     };
@@ -582,7 +622,7 @@ mod tests {
         let helper = dir.join("helper.py");
         std::fs::write(
             &helper,
-            r#"
+            r"
 import json, pathlib, sys
 req = json.load(sys.stdin)
 root = pathlib.Path(__file__).parent
@@ -592,7 +632,7 @@ if req.get('sandboxId') == 'unreachable':
     print(json.dumps({'ok': False, 'error': 'injected API failure'}))
 else:
     print(json.dumps({'ok': True, 'killed': True}))
-"#,
+",
         )?;
         let cfg = super::Config {
             template: "worker".into(),
@@ -604,11 +644,18 @@ else:
             gateway_tunnel: dir.join("gateway.json"),
             gateway_endpoint: "https://localhost:17670".into(),
             gateway_ca: dir.join("ca"),
-            gateway_cert: dir.join("cert"),
-            gateway_key: dir.join("key"),
             owner: "test-owner".into(),
         };
         Ok((cfg, dir))
+    }
+
+    #[test]
+    fn tunnel_rules_allow_only_the_control_socket() {
+        let rules = super::tunnel_rules("abc123");
+        assert!(rules.contains("!PathPrefix '^abc123$'"));
+        assert!(rules.contains("protocol: [Unix]"));
+        assert!(rules.contains(r"unix_path: '^/\.openshell/channel/sandbox/control\.sock$'"));
+        assert!(!rules.contains("!Tunnel"));
     }
 
     #[tokio::test]

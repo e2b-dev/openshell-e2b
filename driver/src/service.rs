@@ -11,7 +11,7 @@
 //!   `CreateSandbox`                     E2B box + fence + runtime + supervisor ✅ (lifecycle.rs)
 //!   Get / List / `WatchSandboxes`       from our in-memory table              ✅
 //!   `DeleteSandbox`                     stop supervisor + tunnel, kill E2B box ✅
-//!   Stop / Start                      "not implemented yet"                 ⏳
+//!   Stop / Start / Suspend            "not implemented yet"                 ⏳
 //!
 //! State lives in memory. If the driver restarts, it forgets its sandboxes
 //! (the E2B boxes stay tagged with metadata, so they can be found and cleaned).
@@ -27,10 +27,10 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event::Payload,
+    StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event::Payload,
 };
 use openshell_core::resource_admission::{DriverAdmissionConfig, ResourceAdmissionConfig};
 use std::collections::{HashMap, HashSet};
@@ -42,7 +42,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
 pub const DRIVER_NAME: &str = "e2b";
-const IMPLEMENTATION: &str = "sudolabs/openshell-driver-e2b";
+const IMPLEMENTATION: &str = "e2b-dev/openshell-driver-e2b";
 
 /// State shared by the gRPC handlers, the driver-owned create/delete tasks,
 /// the health loop and the shutdown path.
@@ -274,6 +274,15 @@ impl ComputeDriver for E2bDriver {
     ) -> Result<Response<StartSandboxResponse>, Status> {
         Err(Status::unimplemented(
             "e2b driver: start not implemented yet",
+        ))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "e2b driver: suspend not implemented yet",
         ))
     }
 

@@ -94,6 +94,9 @@ async function main() {
       assert.equal((await run(sbx, 'test -z "$E2B_API_KEY" && test ! -f /home/user/openshell/driver.env')).exitCode, 0)
     }
     pass('Supervisor and session credentials live in A; E2B management key stays in control')
+    // Supervisors authenticate with their own launch JWT; no shared client certificate.
+    assert.equal((await run(supervisor, 'test -s /run/openshell-task/auth.json && ! ls /run/openshell-task | grep -q client')).exitCode, 0)
+    pass('Supervisor holds its own launch JWT and no gateway client certificate')
     console.log((await inside('printf "  Agent uid="; id -u; grep -E "^(CapEff|NoNewPrivs)" /proc/self/status')).trim())
 
     step('3. Two enforcement layers — OpenShell policy + E2B worker egress fence')

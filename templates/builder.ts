@@ -1,5 +1,6 @@
-// openshell-builder: 8 vCPU / 8 GB box with Rust 1.95 for building OpenShell (+ our E2B driver).
+// openshell-builder: 8 vCPU / 8 GB VM with Rust 1.95 for building OpenShell and our E2B driver.
 import { Template, defaultBuildLogger } from 'e2b'
+import { TEMPLATES } from '../scripts/openshell.ts'
 
 export const template = Template()
   .fromBaseImage()
@@ -13,7 +14,7 @@ export const template = Template()
   ])
   .setEnvs({ PATH: '/home/user/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' })
 
-Template.build(template, 'openshell-builder', {
+await Template.build(template, TEMPLATES.builder, {
   cpuCount: 8,
   memoryMB: 8192,
   onBuildLogs: defaultBuildLogger(),
