@@ -2,7 +2,7 @@
 
 An [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) compute driver that creates **two private E2B microVMs per task**. The shared gateway and compute driver stay outside both task VMs. OpenShell owns policy, program identity, request authorization and audit; E2B owns VM isolation, provisioning and the worker's external network fence.
 
-This is a live demo integration pinned to OpenShell **v0.1.2**, with the limitations below.
+This is a live demo integration built on OpenShell **v0.1.9** (`OPENSHELL_VERSION`), with the limitations below.
 
 ```text
                          SHARED CONTROL PLANE
@@ -21,7 +21,9 @@ This is a live demo integration pinned to OpenShell **v0.1.2**, with the limitat
                        Separate guest kernels; task pair destroyed together
 ```
 
-A initiates authenticated WSS tunnels through E2B's port proxy to B and to the shared gateway. OpenShell's TLS session channel runs inside the worker tunnel. An agent's DNS/TCP/HTTP requests travel from B over that channel to A; A applies OpenShell policy and opens the approved upstream connection. **B never needs a direct internet connection.** This uses the existing public E2B HTTPS transport with private ingress tokens, not private VPC peering.
+A opens two authenticated WSS tunnels through E2B's port proxy: one to the shared gateway, and one reverse tunnel to B. In B, the reverse tunnel listens on the runtime's control socket. As OpenShell requires since v0.1.7, B's runtime dials the supervisor through that socket, and the session channel is OpenShell's own pinned TLS on top. An agent's DNS/TCP/HTTP requests travel from B over that channel to A; A applies OpenShell policy and opens the approved upstream connection. **The network connection always goes from A to B, so B never needs any outbound network.** This uses the existing public E2B HTTPS transport with private ingress tokens, not private VPC peering.
+
+Supervisors verify the gateway with its CA and authenticate with their own per-task launch JWT. They hold no client certificate.
 
 ## Run
 
@@ -72,7 +74,7 @@ cd /Users/matt/e2b/openshell-e2b
 npm run demo:dashboard
 ```
 
-The upper pane is the unmodified OpenShell v0.1.2 `openshell term` UI. The lower-left pane controls the walkthrough; the lower-right pane samples the worker's real heartbeat and kernel process state through E2B. The launcher connects to the gateway automatically and isolates its state under `dist/dashboard/`.
+The upper pane is the unmodified OpenShell `openshell term` UI. The lower-left pane controls the walkthrough; the lower-right pane samples the worker's real heartbeat and kernel process state through E2B. The launcher connects to the gateway automatically and isolates its state under `dist/dashboard/`.
 
 Run these commands in the lower-left pane, pausing to explain each result:
 
@@ -120,7 +122,7 @@ The recorder requires VHS, tmux, gum, FFmpeg and the Menlo font. It connects the
 
 ```bash
 npm run template:builder      # once per E2B team
-npm run build:binaries        # builds current working-tree sources and runs Rust tests
+npm run build:binaries        # NVIDIA supervisor + runtime, our driver (runs the driver's Rust tests)
 npm run template:workload
 npm run template:supervisor
 npm run template:control
@@ -128,32 +130,42 @@ npm run typecheck
 npm run demo:verify
 ```
 
-The templates are `openshell-control-separated`, `openshell-supervisor-separated`, and `openshell-workload-separated`. Original demo template aliases are not changed. The build backports NVIDIA's eMudhra trust fix using rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs 1.0.10.
+The templates are `openshell-control-separated`, `openshell-supervisor-separated`, and `openshell-workload-separated`.
 
-For incremental development, `build:binaries -- --keep-builder` retains the compiler VM; `build:binaries -- --reuse --driver-only --keep-builder` rebuilds the driver there. A failed build retains the compiler VM for diagnosis until its one-hour timeout. It contains source and compiler outputs, not the E2B management key.
+`build:binaries` builds the NVIDIA binaries one of two ways. By default (`OPENSHELL_LANDLOCK_ABI2` unset or `1`) it compiles the supervisor and runtime from the release tag with `patches/landlock-abi2.patch`, because E2B guests run Linux 6.1. With `OPENSHELL_LANDLOCK_ABI2=0` it downloads NVIDIA's stock release binaries unchanged; use that once E2B guests run Linux 6.2 or newer. `dist/<tag>/BUILD.json` records which one was built.
+
+For incremental development, `build:binaries -- --keep-builder` retains the compiler VM; `build:binaries -- --reuse --driver-only --keep-builder` rebuilds only the driver there. A failed build retains the compiler VM for diagnosis until its one-hour timeout. It contains source and compiler outputs, not the E2B management key.
+
+### Upgrading OpenShell
+
+1. Set the new tag in `OPENSHELL_VERSION` and in the three crate tags in `driver/Cargo.toml`. `build:binaries` refuses to run if they disagree.
+2. `cd driver && cargo update -p openshell-core && cargo clippy --all-targets && cargo test`. Upstream type changes land in `boundary.rs` and `service.rs`.
+3. If the patched build is still needed, check that `patches/landlock-abi2.patch` applies to the new tag.
+4. Rebuild the binaries and all three templates, then run `npm run demo:verify`.
 
 ## Implementation boundaries
 
 | Component | Responsibility |
 |---|---|
 | `driver/src/lifecycle.rs` | Create the pair, configure worker isolation, provision task credentials in A, start the supervisor; roll back both on failure |
-| `driver/src/boundary.rs` | NVIDIA boundary descriptors, per-session TLS, workload identity and fence evidence |
+| `driver/src/boundary.rs` | The only module that builds NVIDIA boundary types: descriptors, runtime-initiated transport, fence evidence |
 | `driver/src/health.rs` | Check both VMs and A's process tree; report failed readiness; retry failed rollback deletes |
-| `driver/e2b-helper.mjs` | E2B SDK operations; private ingress for both roles, internet disabled for workers |
-| `templates/launch-supervisor.py` | A's supervisor and two tunnel clients; stop the group if any process exits |
+| `driver/e2b-helper.ts` | E2B SDK operations; private ingress for both roles, internet disabled for workers |
+| `templates/launch-supervisor.py` | A's supervisor, gateway tunnel and reverse worker tunnel; stop the group if any process exits |
 | `templates/launch-sandbox.sh` | B's OpenShell runtime, isolated namespace, uid 1500 and dropped capabilities |
+| `scripts/openshell.ts` | OpenShell version, the Landlock demo switch, release URLs and template names |
 | `scripts/demo-separated.ts` | Real E2B/OpenShell assertions, failure drill and pair cleanup |
 
 The worker keeps OpenShell's Landlock, seccomp, namespace and executable-identity mechanisms. E2B's VM boundary and host networking add independent isolation; this implementation does **not** silently translate filesystem or syscall policy into template scoping. E2B Secrets and request transforms are not integrated in this version.
 
 ## Demo limitations and production work
 
-- **Landlock ABI v2 patch:** the current worker kernel is Linux 6.1. The existing demo patch accepts ABI v2, which does not protect read-only files against truncate. This is not full OpenShell filesystem-policy equivalence.
-- **Shared gateway client certificate:** supervisors still use the demo's CLI mTLS certificate. Per-task launch JWTs and worker TLS sessions are distinct, but A remains trusted with broad gateway access. Production needs scoped gateway authorization and separate client identities; VM separation alone does not solve that.
-- **Control-plane persistence:** driver inventory is in memory. Restarting the driver reaps its metadata-tagged task VMs instead of adopting sessions. Stop/start, pause/resume and durable reconciliation are not implemented.
-- **Lifetimes:** task VMs and the demo control VM have a one-hour TTL. The logical control plane is shared across tasks, but this demo does not provision an indefinitely available production gateway. Create a fresh control plane shortly before presenting.
-- **Network transport:** WSS through E2B's ingress proxy adds hops. Private sandbox-to-sandbox transport and narrower supervisor egress are future improvements. The external worker fence is configured at create time; the boundary evidence records this configuration rather than a platform-signed attestation.
-- **Templates:** descriptors currently reference template aliases rather than immutable build IDs.
+- **Landlock ABI v2 patch:** the worker kernel is Linux 6.1. The default build patches OpenShell to accept ABI v2, which does not protect read-only files against truncate. This is not full OpenShell filesystem-policy equivalence. The stock build (`OPENSHELL_LANDLOCK_ABI2=0`) needs Linux 6.2 or newer.
+- **Control-plane persistence:** driver inventory is in memory. Restarting the driver reaps its metadata-tagged task VMs instead of adopting them. Stop/start and suspend/resume (`SuspendSandbox`, E2B pause) are not implemented yet. On SIGTERM the driver refuses new creates, cancels creates in flight, and rolls their VMs back within its 15-second budget. An E2B create call that is still waiting for its VM id is not abandoned; if it outlasts the budget, that VM stays until its TTL or the next driver start.
+- **Isolation backends:** the driver uses the stock OpenShell runtime and rejects an operator-selected external isolation backend.
+- **Lifetimes:** task VMs and the demo control VM have a one-hour TTL. Create a fresh control plane shortly before presenting.
+- **Network transport:** WSS through E2B's ingress proxy adds hops. Private sandbox-to-sandbox transport and narrower supervisor egress are future improvements. The external worker fence is configured at create time; the fence evidence records this configuration rather than a platform-signed attestation.
+- **Templates:** descriptors reference template aliases rather than immutable build IDs.
 
 ## License
 

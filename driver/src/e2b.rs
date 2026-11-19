@@ -1,6 +1,6 @@
-//! Thin client for E2B: runs `node e2b-helper.mjs <op>` with a JSON request.
+//! Thin client for E2B: runs `node e2b-helper.ts <op>` with a JSON request.
 //!
-//!   Rust (this file) ──JSON on stdin──► e2b-helper.mjs ──E2B SDK──► E2B
+//!   Rust (this file) ──JSON on stdin──► e2b-helper.ts ──E2B SDK──► E2B
 //!                    ◄─JSON on stdout──
 //!
 //! The helper uses E2B's official JS SDK, so this file only has to shuttle JSON.

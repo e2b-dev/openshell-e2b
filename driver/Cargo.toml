@@ -7,9 +7,9 @@ description = "OpenShell compute driver that runs sandboxes on E2B"
 
 [dependencies]
 # NVIDIA OpenShell crates, pinned to the release we build against.
-openshell-core = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.2", default-features = false, features = ["jwt"] }
-openshell-sandbox-backend = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.2" }
-openshell-isolation-interface = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.2" }
+openshell-core = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.9", default-features = false, features = ["jwt"] }
+openshell-sandbox-backend = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.9" }
+openshell-isolation-interface = { git = "https://github.com/NVIDIA/OpenShell", tag = "v0.1.9" }
 
 tokio = { version = "1.43", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

@@ -6,7 +6,9 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
     "types": ["node"]
   },
-  "include": ["scripts/**/*.ts", "templates/**/*.ts"]
+  "include": ["scripts/**/*.ts", "templates/**/*.ts", "driver/*.ts"]
 }

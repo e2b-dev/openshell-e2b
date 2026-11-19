@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one task's supervisor and its two authenticated transports in sandbox A.
+"""Run one task's supervisor and its two authenticated tunnels in supervisor VM A.
 
 Only an allowlisted environment reaches subprocesses. If any child exits,
 terminate all of them; OpenShell's worker channel then fails closed.
@@ -29,14 +29,27 @@ def start(name, args, env):
     return child
 
 
-def tunnel(name, spec, port, destination):
-    # No E2B management credential is installed in this VM.
-    return start(name, [BIN + '/wstunnel', 'client', '-L',
-        f'tcp://127.0.0.1:{port}:127.0.0.1:{destination}',
+def wstunnel(name, spec, forward):
+    # One authenticated WebSocket tunnel through E2B's port proxy. No E2B
+    # management credential is installed in this VM.
+    return start(name, [BIN + '/wstunnel', 'client', *forward,
         '--http-upgrade-path-prefix', spec['path'],
         '-H', 'e2b-traffic-access-token: ' + spec['token'],
         '--websocket-ping-frequency', '10s', '--tls-verify-certificate',
         'wss://' + spec['host']], {'PATH': '/usr/bin:/bin', 'NO_COLOR': 'true'})
+
+
+def wait_listening(port, seconds=30):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if any(p.poll() is not None for _, p in children):
+            raise RuntimeError('a process exited during startup')
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=.2):
+                return
+        except OSError:
+            time.sleep(.2)
+    raise RuntimeError(f'nothing listening on 127.0.0.1:{port}')
 
 
 def main():
@@ -45,25 +58,29 @@ def main():
     signal.signal(signal.SIGINT, stop)
     (STATE / 'launcher.pid').write_text(str(os.getpid()))
     config = json.loads((STATE / 'config.json').read_text())
-    tunnel('worker-tunnel', config['worker'], 17000, 7000)
-    tunnel('gateway-tunnel', config['gateway'], 17670, 17670)
-    # A listener must exist before OpenShell tries to connect. The gateway
-    # itself decides Ready only after the supervisor authenticates/admission.
-    for port in (17000, 17670):
-        for _ in range(100):
-            if any(p.poll() is not None for _, p in children):
-                raise RuntimeError('transport exited during startup')
-            try:
-                with socket.create_connection(('127.0.0.1', port), timeout=.2):
-                    break
-            except OSError:
-                time.sleep(.1)
-        else:
-            raise RuntimeError('transport did not start')
+    worker = config['worker']
+    listen_host, listen_port = worker['listen'].rsplit(':', 1)
+
+    # 1. Gateway: a local port here that reaches the gateway in the control VM.
+    wstunnel('gateway-tunnel', config['gateway'],
+        ['-L', 'tcp://127.0.0.1:17670:127.0.0.1:17670'])
+    wait_listening(17670)
+
+    # 2. The supervisor. It connects to the gateway and listens on
+    #    listen_port for the worker's runtime (runtime-initiated transport).
     start('supervisor', [BIN + '/openshell-supervisor',
         '--backend-descriptor-file', str(STATE / 'runtime-descriptor.json'),
         '--auth-bundle-file', str(STATE / 'auth.json'), '--workdir', '/sandbox'],
         config['environment'])
+    wait_listening(int(listen_port))
+
+    # 3. Worker: a reverse tunnel. The wstunnel server in the worker VM
+    #    listens on the runtime's control socket and carries each connection
+    #    back here to the supervisor. This VM opens the connection, so the
+    #    worker VM needs no outbound network.
+    wstunnel('worker-tunnel', worker,
+        ['-R', f"unix://{worker['socket']}:{listen_host}:{listen_port}"])
+
     time.sleep(2)
     while True:
         for name, child in children:

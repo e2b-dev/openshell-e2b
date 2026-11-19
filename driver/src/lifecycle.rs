@@ -1,7 +1,13 @@
-//! One task = a supervisor microVM plus a worker microVM.
-//! The shared gateway/driver owns both lifecycles; no task processes run here.
-//! E2B denies worker egress outside the guest. `OpenShell` keeps its runtime
-//! fence and session-authenticated channel inside that boundary.
+//! One task = a supervisor microVM (A) plus a worker microVM (B).
+//!
+//! The shared gateway and this driver own both lifecycles; no task process runs
+//! in the control VM. E2B denies B all egress outside the guest. `OpenShell`
+//! keeps its runtime fence and session-authenticated channel inside that.
+//!
+//!   A: supervisor ── listens 127.0.0.1:17000 ◄── wstunnel client ══ wss ══╗
+//!      wstunnel client ══ wss ══► control VM :9000 → gateway             ║
+//!   B: wstunnel server :9000 (reverse, one Unix socket only) ◄════════════╝
+//!      └─ control.sock ◄── openshell-sandbox dials (runtime-initiated)
 
 use crate::boundary::{self, E2bBoundarySpec};
 use crate::e2b::E2b;
@@ -14,17 +20,18 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use rand::RngCore;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use tokio::sync::watch;
 
 use tracing::{info, warn};
 
 const WORKLOAD_UID: u32 = 1500;
-/// Port inside the agent box that E2B's proxy exposes (tunnel server).
+/// Port inside the worker VM that E2B's proxy exposes (tunnel server).
 const TUNNEL_PORT: u16 = 9000;
-/// socat inside the agent box: TCP 127.0.0.1:7000 → control.sock.
-const SOCAT_PORT: u16 = 7000;
+/// Task state in the supervisor VM.
 const DIR: &str = "/run/openshell-task";
+/// wstunnel restriction file in the worker VM.
+const TUNNEL_RULES: &str = "/run/openshell-tunnel.yaml";
 
 /// Everything the driver needs to know about its surroundings.
 #[derive(Clone, Debug)]
@@ -34,10 +41,10 @@ pub struct Config {
     pub supervisor_template: String,
     pub gateway_tunnel: PathBuf,
     pub gateway_endpoint: String,
-    /// Client cert the supervisor uses to reach the gateway with mutual TLS.
+    /// CA that signed the gateway's server certificate. Supervisors verify the
+    /// gateway with it and authenticate with their own launch JWT; they hold
+    /// no client certificate.
     pub gateway_ca: PathBuf,
-    pub gateway_cert: PathBuf,
-    pub gateway_key: PathBuf,
     pub owner: String,
 }
 
@@ -146,7 +153,13 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, CreateError> {
+/// Create and start one task pair. `cancel` (delete or shutdown) stops it at
+/// the next step and rolls back whatever it allocated.
+pub async fn create(
+    cfg: &Config,
+    sandbox: &DriverSandbox,
+    cancel: watch::Receiver<bool>,
+) -> Result<Running, CreateError> {
     let spec = sandbox
         .spec
         .as_ref()
@@ -170,33 +183,29 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, Cr
             "openshell.ai/role": role,
         })
     };
-    // Create B first, then A. Every failure rolls back everything allocated.
-    let worker = cfg
-        .e2b
-        .create(&cfg.template, metadata("worker"), false)
-        .await?;
-    let supervisor = match cfg
-        .e2b
-        .create(&cfg.supervisor_template, metadata("supervisor"), true)
-        .await
-    {
-        Ok(created) => created,
-        Err(message) => return Err(rollback(cfg, message, &[&worker.sandbox_id]).await),
-    };
-    info!(sandbox = %sandbox.name, worker = %worker.sandbox_id, supervisor = %supervisor.sandbox_id, "E2B task pair created");
-    if let Err(message) = provision_and_start(
+    let (worker, supervisor) = allocate_pair(
         cfg,
-        sandbox,
-        &auth,
-        session_id,
-        &generation,
-        &worker,
-        &supervisor,
+        metadata("worker"),
+        metadata("supervisor"),
+        cancel.clone(),
     )
-    .await
-    {
-        return Err(rollback(cfg, message, &[&supervisor.sandbox_id, &worker.sandbox_id]).await);
-    }
+    .await?;
+    info!(sandbox = %sandbox.name, worker = %worker.sandbox_id, supervisor = %supervisor.sandbox_id, "E2B task pair created");
+    run_or_roll_back(
+        cfg,
+        &[&supervisor.sandbox_id, &worker.sandbox_id],
+        cancel,
+        provision_and_start(
+            cfg,
+            sandbox,
+            &auth,
+            session_id,
+            &generation,
+            &worker,
+            &supervisor,
+        ),
+    )
+    .await?;
     Ok(Running {
         sandbox: DriverSandbox {
             status: Some(status(
@@ -213,10 +222,69 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, Cr
     })
 }
 
+const CANCELLED: &str = "create cancelled (sandbox deleted or driver stopping)";
+
+/// Create B first, then A. A failure or a cancel after either create kills
+/// what exists. An E2B create already in flight is never abandoned: its VM
+/// id would be lost.
+async fn allocate_pair(
+    cfg: &Config,
+    worker_metadata: serde_json::Value,
+    supervisor_metadata: serde_json::Value,
+    cancel: watch::Receiver<bool>,
+) -> Result<(crate::e2b::Created, crate::e2b::Created), CreateError> {
+    let worker = cfg
+        .e2b
+        .create(&cfg.template, worker_metadata, false)
+        .await?;
+    if *cancel.borrow() {
+        return Err(rollback(cfg, CANCELLED.into(), &[&worker.sandbox_id]).await);
+    }
+    let supervisor = match cfg
+        .e2b
+        .create(&cfg.supervisor_template, supervisor_metadata, true)
+        .await
+    {
+        Ok(created) => created,
+        Err(message) => return Err(rollback(cfg, message, &[&worker.sandbox_id]).await),
+    };
+    if *cancel.borrow() {
+        let ids = [supervisor.sandbox_id.as_str(), worker.sandbox_id.as_str()];
+        return Err(rollback(cfg, CANCELLED.into(), &ids).await);
+    }
+    Ok((worker, supervisor))
+}
+
+/// Run `work` until it finishes or `cancel` fires. On an error or a cancel,
+/// kill `ids`. Dropping `work` mid-way is safe: every VM it touches is in `ids`.
+async fn run_or_roll_back(
+    cfg: &Config,
+    ids: &[&str],
+    mut cancel: watch::Receiver<bool>,
+    work: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), CreateError> {
+    let cancelled = async {
+        // A dropped sender means nobody can cancel any more.
+        if cancel.wait_for(|c| *c).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let outcome = tokio::select! {
+        result = work => result,
+        () = cancelled => Err(CANCELLED.into()),
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(message) => Err(rollback(cfg, message, ids).await),
+    }
+}
+
+/// Kill every VM at once, so one stalled kill cannot hold back the others.
 async fn rollback(cfg: &Config, message: String, ids: &[&str]) -> CreateError {
+    let results = futures::future::join_all(ids.iter().map(|id| cfg.e2b.kill(id))).await;
     let mut leaked_boxes = Vec::new();
-    for id in ids {
-        if let Err(error) = cfg.e2b.kill(id).await {
+    for (id, result) in ids.iter().zip(results) {
+        if let Err(error) = result {
             warn!(e2b = %id, %error, "rollback failed; health monitor will retry");
             leaked_boxes.push((*id).to_owned());
         }
@@ -268,7 +336,6 @@ async fn provision_and_start(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let supervisor_connect = SocketAddr::from(([127, 0, 0, 1], 17000));
     let identity = ResolvedWorkloadIdentity::new(
         WORKLOAD_UID,
         WORKLOAD_UID,
@@ -288,7 +355,6 @@ async fn provision_and_start(
         e2b_sandbox_id: e2b_id.to_string(),
         template: cfg.template.clone(),
         fenced_interfaces,
-        supervisor_connect,
         supervisor_tls: SandboxTlsClientConfig {
             server_name: tls.server_name.clone(),
             trust_anchor_pem: tls.trust_anchor_pem.clone(),
@@ -330,17 +396,20 @@ async fn provision_and_start(
         )
         .await?;
 
-    // 7. Tunnel 2, server side. socat turns the Unix socket into a local TCP
-    //    port; wstunnel exposes only that port, only on a random path.
+    // 7. The worker side of the control channel. The supervisor VM opens a
+    //    reverse tunnel to this server; the server then listens on
+    //    control.sock, which the runtime dials. Only that one reverse Unix
+    //    socket, only behind the random path. Runs as uid 1500 so the socket
+    //    it creates belongs to the runtime's user.
     let path_secret = random_hex(16);
+    let rules = tunnel_rules(&path_secret);
     cfg.e2b
-        .run_background(
+        .write(e2b_id, TUNNEL_RULES, rules.as_bytes(), "root", Some(0o600))
+        .await?;
+    cfg.e2b
+        .run_ok(
             e2b_id,
-            &format!(
-                "for i in $(seq 50); do [ -S {sock} ] && break; sleep 0.2; done; [ -S {sock} ] || exit 1; \
-                 exec socat TCP-LISTEN:{SOCAT_PORT},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{sock} > /tmp/socat.log 2>&1",
-                sock = boundary::CONTROL_SOCKET_PATH
-            ),
+            &format!("chown {WORKLOAD_UID}:{WORKLOAD_UID} {TUNNEL_RULES}"),
             "root",
         )
         .await?;
@@ -348,8 +417,20 @@ async fn provision_and_start(
         .run_background(
             e2b_id,
             &format!(
-                "exec /opt/openshell/wstunnel server ws://0.0.0.0:{TUNNEL_PORT} --restrict-to 127.0.0.1:{SOCAT_PORT} \
-                 --restrict-http-upgrade-path-prefix {path_secret} > /tmp/wstunnel.log 2>&1"
+                "exec setpriv --reuid={WORKLOAD_UID} --regid={WORKLOAD_UID} --clear-groups --no-new-privs \
+                 /opt/openshell/wstunnel server ws://0.0.0.0:{TUNNEL_PORT} --restrict-config {TUNNEL_RULES} \
+                 > /tmp/wstunnel.log 2>&1"
+            ),
+            "root",
+        )
+        .await?;
+    // It runs in the background: confirm it is up (a bad rules file exits it).
+    cfg.e2b
+        .run_ok(
+            e2b_id,
+            &format!(
+                "for i in $(seq 50); do ss -ltn | grep -q ':{TUNNEL_PORT} ' && exit 0; sleep 0.2; done; \
+                 tail -5 /tmp/wstunnel.log >&2; exit 1"
             ),
             "root",
         )
@@ -375,18 +456,6 @@ async fn provision_and_start(
         (
             "gateway-ca.crt",
             tokio::fs::read(&cfg.gateway_ca)
-                .await
-                .map_err(|e| e.to_string())?,
-        ),
-        (
-            "gateway-client.crt",
-            tokio::fs::read(&cfg.gateway_cert)
-                .await
-                .map_err(|e| e.to_string())?,
-        ),
-        (
-            "gateway-client.key",
-            tokio::fs::read(&cfg.gateway_key)
                 .await
                 .map_err(|e| e.to_string())?,
         ),
@@ -428,11 +497,15 @@ async fn provision_and_start(
         (env::LOG_LEVEL, "info".to_owned()),
         (env::TELEMETRY_ENABLED, "false".to_owned()),
         (env::TLS_CA, format!("{DIR}/gateway-ca.crt")),
-        (env::TLS_CERT, format!("{DIR}/gateway-client.crt")),
-        (env::TLS_KEY, format!("{DIR}/gateway-client.key")),
     ]);
     let config = serde_json::json!({
-        "worker": {"host": boxed.host9000, "token": boxed.traffic_access_token, "path": path_secret},
+        "worker": {
+            "host": boxed.host9000,
+            "token": boxed.traffic_access_token,
+            "path": path_secret,
+            "socket": boundary::CONTROL_SOCKET_PATH,
+            "listen": boundary::SUPERVISOR_LISTEN.to_string(),
+        },
         "gateway": gateway,
         "environment": environment,
     });
@@ -452,9 +525,29 @@ async fn provision_and_start(
             "root",
         )
         .await?;
-    cfg.e2b.run_ok(supervisor_id, "for i in $(seq 100); do test -f /run/openshell-task/ready && exit 0; test -f /run/openshell-task/failed && exit 1; sleep 0.2; done; exit 1", "root").await?;
+    cfg.e2b.run_ok(supervisor_id, "for i in $(seq 300); do test -f /run/openshell-task/ready && exit 0; test -f /run/openshell-task/failed && exit 1; sleep 0.2; done; exit 1", "root").await?;
     info!(sandbox = %sandbox.name, worker = %e2b_id, supervisor = %supervisor_id, "separate supervisor started");
     Ok(())
+}
+
+/// wstunnel server rules for the worker VM: deny everything except one
+/// reverse tunnel that listens on the runtime's control socket, and only for
+/// clients that know this task's random path.
+fn tunnel_rules(path_secret: &str) -> String {
+    let socket = boundary::CONTROL_SOCKET_PATH.replace('.', "\\.");
+    [
+        "restrictions:".to_owned(),
+        "  - name: openshell-control".to_owned(),
+        "    match:".to_owned(),
+        // Single-quoted YAML: backslashes in the regex stay literal.
+        format!("      - !PathPrefix '^{path_secret}$'"),
+        "    allow:".to_owned(),
+        "      - !ReverseTunnel".to_owned(),
+        "        protocol: [Unix]".to_owned(),
+        format!("        unix_path: '^{socket}$'"),
+        String::new(),
+    ]
+    .join("\n")
 }
 
 /// User environment for the agent, minus names `OpenShell` reserves for itself
@@ -495,6 +588,15 @@ pub async fn delete(
 /// as uid/gid 1500, without user namespaces.
 pub fn check_supported(cfg: &Config, sandbox: &DriverSandbox) -> Result<(), String> {
     check_identity(sandbox)?;
+    // We do not advertise `openshell.compute.isolation-backend`; never fall
+    // back to the built-in runtime when an operator selected another one.
+    if sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|s| s.isolation_backend.is_some())
+    {
+        return Err("external isolation backends are not supported by the e2b driver".into());
+    }
     let Some(template) = sandbox.spec.as_ref().and_then(|s| s.template.as_ref()) else {
         return Ok(());
     };
@@ -582,7 +684,7 @@ mod tests {
         let helper = dir.join("helper.py");
         std::fs::write(
             &helper,
-            r#"
+            r"
 import json, pathlib, sys
 req = json.load(sys.stdin)
 root = pathlib.Path(__file__).parent
@@ -590,9 +692,16 @@ with (root / 'calls.jsonl').open('a') as f:
     f.write(json.dumps({'op': sys.argv[1], **req}) + '\n')
 if req.get('sandboxId') == 'unreachable':
     print(json.dumps({'ok': False, 'error': 'injected API failure'}))
+elif req.get('sandboxId') == 'stalled':
+    import time
+    time.sleep(3)
+    print(json.dumps({'ok': True, 'killed': True}))
+elif sys.argv[1] == 'create':
+    sid = req['template'] + '-vm'
+    print(json.dumps({'ok': True, 'sandboxId': sid, 'trafficAccessToken': 't', 'host9000': 'h'}))
 else:
     print(json.dumps({'ok': True, 'killed': True}))
-"#,
+",
         )?;
         let cfg = super::Config {
             template: "worker".into(),
@@ -604,11 +713,18 @@ else:
             gateway_tunnel: dir.join("gateway.json"),
             gateway_endpoint: "https://localhost:17670".into(),
             gateway_ca: dir.join("ca"),
-            gateway_cert: dir.join("cert"),
-            gateway_key: dir.join("key"),
             owner: "test-owner".into(),
         };
         Ok((cfg, dir))
+    }
+
+    #[test]
+    fn tunnel_rules_allow_only_the_control_socket() {
+        let rules = super::tunnel_rules("abc123");
+        assert!(rules.contains("!PathPrefix '^abc123$'"));
+        assert!(rules.contains("protocol: [Unix]"));
+        assert!(rules.contains(r"unix_path: '^/\.openshell/channel/sandbox/control\.sock$'"));
+        assert!(!rules.contains("!Tunnel"));
     }
 
     #[tokio::test]
@@ -623,6 +739,101 @@ else:
         let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
         assert_eq!(calls.lines().count(), 2);
         assert!(calls.contains("worker") && calls.contains("unreachable"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    fn kills(dir: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(std::fs::read_to_string(dir.join("calls.jsonl"))?
+            .lines()
+            .filter(|l| l.contains(r#""op": "kill""#))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn cancel_during_provisioning_kills_both_vms_promptly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("cancel-provision")?;
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        let creating = tokio::spawn(async move {
+            // Provisioning that would take far longer than the shutdown budget.
+            let slow = async {
+                tokio::time::sleep(std::time::Duration::from_mins(1)).await;
+                Ok(())
+            };
+            super::run_or_roll_back(&cfg, &["supervisor-vm", "worker-vm"], cancel_rx, slow).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.send_replace(true);
+        let error = creating.await?.err().ok_or("cancelled create must fail")?;
+        assert!(error.message.contains("cancelled"));
+        assert!(error.leaked_boxes.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let kills = kills(&dir)?;
+        assert_eq!(kills.len(), 2);
+        assert!(kills.iter().any(|k| k.contains("supervisor-vm")));
+        assert!(kills.iter().any(|k| k.contains("worker-vm")));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_before_allocation_finishes_rolls_back_the_allocated_vms()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("cancel-allocate")?;
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(true);
+        let error = super::allocate_pair(
+            &cfg,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            cancel_rx,
+        )
+        .await
+        .err()
+        .ok_or("cancelled allocation must fail")?;
+        assert!(error.message.contains("cancelled"));
+        // Cancelled after the worker existed: the worker is killed, and the
+        // supervisor is never created.
+        let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
+        assert_eq!(calls.matches(r#""op": "create""#).count(), 1);
+        assert_eq!(kills(&dir)?.len(), 1);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncancelled_provisioning_kills_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("no-cancel")?;
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        super::run_or_roll_back(&cfg, &["supervisor-vm", "worker-vm"], cancel_rx, async {
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.message)?;
+        assert!(!dir.join("calls.jsonl").exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_kills_all_vms_at_once() -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("rollback-parallel")?;
+        let rolling_back = tokio::spawn(async move {
+            super::rollback(&cfg, "cancelled".into(), &["stalled", "worker-vm"]).await
+        });
+        // The worker kill starts while the supervisor kill is still stalled.
+        let mut worker_killed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if kills(&dir).is_ok_and(|k| k.iter().any(|l| l.contains("worker-vm"))) {
+                worker_killed = true;
+                break;
+            }
+        }
+        assert!(worker_killed && !rolling_back.is_finished());
+        assert!(rolling_back.await?.leaked_boxes.is_empty());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
