@@ -40,10 +40,10 @@ pub struct Config {
     pub supervisor_template: String,
     pub gateway_tunnel: PathBuf,
     pub gateway_endpoint: String,
-    /// Client cert the supervisor uses to reach the gateway with mutual TLS.
+    /// CA that signed the gateway's server certificate. Supervisors verify the
+    /// gateway with it and authenticate with their own launch JWT; they hold
+    /// no client certificate.
     pub gateway_ca: PathBuf,
-    pub gateway_cert: PathBuf,
-    pub gateway_key: PathBuf,
     pub owner: String,
 }
 
@@ -397,18 +397,6 @@ async fn provision_and_start(
                 .await
                 .map_err(|e| e.to_string())?,
         ),
-        (
-            "gateway-client.crt",
-            tokio::fs::read(&cfg.gateway_cert)
-                .await
-                .map_err(|e| e.to_string())?,
-        ),
-        (
-            "gateway-client.key",
-            tokio::fs::read(&cfg.gateway_key)
-                .await
-                .map_err(|e| e.to_string())?,
-        ),
     ] {
         cfg.e2b
             .write(
@@ -447,8 +435,6 @@ async fn provision_and_start(
         (env::LOG_LEVEL, "info".to_owned()),
         (env::TELEMETRY_ENABLED, "false".to_owned()),
         (env::TLS_CA, format!("{DIR}/gateway-ca.crt")),
-        (env::TLS_CERT, format!("{DIR}/gateway-client.crt")),
-        (env::TLS_KEY, format!("{DIR}/gateway-client.key")),
     ]);
     let config = serde_json::json!({
         "worker": {
@@ -658,8 +644,6 @@ else:
             gateway_tunnel: dir.join("gateway.json"),
             gateway_endpoint: "https://localhost:17670".into(),
             gateway_ca: dir.join("ca"),
-            gateway_cert: dir.join("cert"),
-            gateway_key: dir.join("key"),
             owner: "test-owner".into(),
         };
         Ok((cfg, dir))

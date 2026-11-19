@@ -17,6 +17,7 @@
 //   2. wstunnel only accepts our random path and only forwards to the gateway port
 //   3. the tunnel client verifies E2B's TLS certificate (otherwise 1 and 2 could be intercepted)
 //   4. inside the tunnel, the CLI and gateway speak mutual TLS end to end
+//      (supervisors use the same tunnel server with server-verified TLS + their launch JWT)
 //
 // Keeps running (it holds the tunnel open). Ctrl-C to stop; the control box keeps running.
 // Note: on a team with a 1-hour sandbox cap the control box dies an hour after creation;
@@ -85,7 +86,8 @@ async function main() {
   // VM always runs the config this checkout expects.
   //   [openshell.gateway.tls]   laptop CLI and supervisors reach the gateway over TLS.
   //                             client_ca_path makes client certificates optional
-  //                             but verified.
+  //                             but verified: the CLI presents one, supervisors
+  //                             authenticate with their launch JWT instead.
   //   [openshell.gateway.mtls_auth]    a valid CLI certificate = a gateway user.
   //   [openshell.gateway.gateway_jwt]  mints launch credentials; without it
   //                             CreateSandbox arrives with no launch_authentication.
@@ -171,7 +173,7 @@ async function main() {
     `--supervisor-template ${TEMPLATES.supervisor} --owner ${sbx.sandboxId} ` +
     `--helper ${ROOT}/helper/e2b-helper.ts --node ${ROOT}/node/bin/node ` +
     `--gateway-tunnel ${STATE}/gateway-tunnel.json --state-dir ${STATE}/sandboxes ` +
-    `--gateway-ca ${STATE}/pki/ca.crt --gateway-cert ${STATE}/pki/client/tls.crt --gateway-key ${STATE}/pki/client/tls.key'`,
+    `--gateway-ca ${STATE}/pki/ca.crt'`,
     restart)
   await daemon('gateway', `${ROOT}/bin/openshell-gateway --config ${STATE}/gateway.toml`, restart)
 
