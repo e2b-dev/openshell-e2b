@@ -21,7 +21,6 @@ use openshell_sandbox_backend::boundary_protocol::{
 use rand::RngCore;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::sync::watch;
 
 use tracing::{info, warn};
 
@@ -41,10 +40,10 @@ pub struct Config {
     pub supervisor_template: String,
     pub gateway_tunnel: PathBuf,
     pub gateway_endpoint: String,
-    /// CA that signed the gateway's server certificate. Supervisors verify the
-    /// gateway with it and authenticate with their own launch JWT; they hold
-    /// no client certificate.
+    /// Client cert the supervisor uses to reach the gateway with mutual TLS.
     pub gateway_ca: PathBuf,
+    pub gateway_cert: PathBuf,
+    pub gateway_key: PathBuf,
     pub owner: String,
 }
 
@@ -153,13 +152,7 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Create and start one task pair. `cancel` (delete or shutdown) stops it at
-/// the next step and rolls back whatever it allocated.
-pub async fn create(
-    cfg: &Config,
-    sandbox: &DriverSandbox,
-    cancel: watch::Receiver<bool>,
-) -> Result<Running, CreateError> {
+pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, CreateError> {
     let spec = sandbox
         .spec
         .as_ref()
@@ -183,29 +176,33 @@ pub async fn create(
             "openshell.ai/role": role,
         })
     };
-    let (worker, supervisor) = allocate_pair(
-        cfg,
-        metadata("worker"),
-        metadata("supervisor"),
-        cancel.clone(),
-    )
-    .await?;
+    // Create B first, then A. Every failure rolls back everything allocated.
+    let worker = cfg
+        .e2b
+        .create(&cfg.template, metadata("worker"), false)
+        .await?;
+    let supervisor = match cfg
+        .e2b
+        .create(&cfg.supervisor_template, metadata("supervisor"), true)
+        .await
+    {
+        Ok(created) => created,
+        Err(message) => return Err(rollback(cfg, message, &[&worker.sandbox_id]).await),
+    };
     info!(sandbox = %sandbox.name, worker = %worker.sandbox_id, supervisor = %supervisor.sandbox_id, "E2B task pair created");
-    run_or_roll_back(
+    if let Err(message) = provision_and_start(
         cfg,
-        &[&supervisor.sandbox_id, &worker.sandbox_id],
-        cancel,
-        provision_and_start(
-            cfg,
-            sandbox,
-            &auth,
-            session_id,
-            &generation,
-            &worker,
-            &supervisor,
-        ),
+        sandbox,
+        &auth,
+        session_id,
+        &generation,
+        &worker,
+        &supervisor,
     )
-    .await?;
+    .await
+    {
+        return Err(rollback(cfg, message, &[&supervisor.sandbox_id, &worker.sandbox_id]).await);
+    }
     Ok(Running {
         sandbox: DriverSandbox {
             status: Some(status(
@@ -222,69 +219,10 @@ pub async fn create(
     })
 }
 
-const CANCELLED: &str = "create cancelled (sandbox deleted or driver stopping)";
-
-/// Create B first, then A. A failure or a cancel after either create kills
-/// what exists. An E2B create already in flight is never abandoned: its VM
-/// id would be lost.
-async fn allocate_pair(
-    cfg: &Config,
-    worker_metadata: serde_json::Value,
-    supervisor_metadata: serde_json::Value,
-    cancel: watch::Receiver<bool>,
-) -> Result<(crate::e2b::Created, crate::e2b::Created), CreateError> {
-    let worker = cfg
-        .e2b
-        .create(&cfg.template, worker_metadata, false)
-        .await?;
-    if *cancel.borrow() {
-        return Err(rollback(cfg, CANCELLED.into(), &[&worker.sandbox_id]).await);
-    }
-    let supervisor = match cfg
-        .e2b
-        .create(&cfg.supervisor_template, supervisor_metadata, true)
-        .await
-    {
-        Ok(created) => created,
-        Err(message) => return Err(rollback(cfg, message, &[&worker.sandbox_id]).await),
-    };
-    if *cancel.borrow() {
-        let ids = [supervisor.sandbox_id.as_str(), worker.sandbox_id.as_str()];
-        return Err(rollback(cfg, CANCELLED.into(), &ids).await);
-    }
-    Ok((worker, supervisor))
-}
-
-/// Run `work` until it finishes or `cancel` fires. On an error or a cancel,
-/// kill `ids`. Dropping `work` mid-way is safe: every VM it touches is in `ids`.
-async fn run_or_roll_back(
-    cfg: &Config,
-    ids: &[&str],
-    mut cancel: watch::Receiver<bool>,
-    work: impl std::future::Future<Output = Result<(), String>>,
-) -> Result<(), CreateError> {
-    let cancelled = async {
-        // A dropped sender means nobody can cancel any more.
-        if cancel.wait_for(|c| *c).await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
-    let outcome = tokio::select! {
-        result = work => result,
-        () = cancelled => Err(CANCELLED.into()),
-    };
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(message) => Err(rollback(cfg, message, ids).await),
-    }
-}
-
-/// Kill every VM at once, so one stalled kill cannot hold back the others.
 async fn rollback(cfg: &Config, message: String, ids: &[&str]) -> CreateError {
-    let results = futures::future::join_all(ids.iter().map(|id| cfg.e2b.kill(id))).await;
     let mut leaked_boxes = Vec::new();
-    for (id, result) in ids.iter().zip(results) {
-        if let Err(error) = result {
+    for id in ids {
+        if let Err(error) = cfg.e2b.kill(id).await {
             warn!(e2b = %id, %error, "rollback failed; health monitor will retry");
             leaked_boxes.push((*id).to_owned());
         }
@@ -459,6 +397,18 @@ async fn provision_and_start(
                 .await
                 .map_err(|e| e.to_string())?,
         ),
+        (
+            "gateway-client.crt",
+            tokio::fs::read(&cfg.gateway_cert)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+        (
+            "gateway-client.key",
+            tokio::fs::read(&cfg.gateway_key)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
     ] {
         cfg.e2b
             .write(
@@ -497,6 +447,8 @@ async fn provision_and_start(
         (env::LOG_LEVEL, "info".to_owned()),
         (env::TELEMETRY_ENABLED, "false".to_owned()),
         (env::TLS_CA, format!("{DIR}/gateway-ca.crt")),
+        (env::TLS_CERT, format!("{DIR}/gateway-client.crt")),
+        (env::TLS_KEY, format!("{DIR}/gateway-client.key")),
     ]);
     let config = serde_json::json!({
         "worker": {
@@ -692,13 +644,6 @@ with (root / 'calls.jsonl').open('a') as f:
     f.write(json.dumps({'op': sys.argv[1], **req}) + '\n')
 if req.get('sandboxId') == 'unreachable':
     print(json.dumps({'ok': False, 'error': 'injected API failure'}))
-elif req.get('sandboxId') == 'stalled':
-    import time
-    time.sleep(3)
-    print(json.dumps({'ok': True, 'killed': True}))
-elif sys.argv[1] == 'create':
-    sid = req['template'] + '-vm'
-    print(json.dumps({'ok': True, 'sandboxId': sid, 'trafficAccessToken': 't', 'host9000': 'h'}))
 else:
     print(json.dumps({'ok': True, 'killed': True}))
 ",
@@ -713,6 +658,8 @@ else:
             gateway_tunnel: dir.join("gateway.json"),
             gateway_endpoint: "https://localhost:17670".into(),
             gateway_ca: dir.join("ca"),
+            gateway_cert: dir.join("cert"),
+            gateway_key: dir.join("key"),
             owner: "test-owner".into(),
         };
         Ok((cfg, dir))
@@ -739,101 +686,6 @@ else:
         let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
         assert_eq!(calls.lines().count(), 2);
         assert!(calls.contains("worker") && calls.contains("unreachable"));
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    fn kills(dir: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(std::fs::read_to_string(dir.join("calls.jsonl"))?
-            .lines()
-            .filter(|l| l.contains(r#""op": "kill""#))
-            .map(str::to_owned)
-            .collect())
-    }
-
-    #[tokio::test]
-    async fn cancel_during_provisioning_kills_both_vms_promptly()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (cfg, dir) = fake_config("cancel-provision")?;
-        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
-        let started = std::time::Instant::now();
-        let creating = tokio::spawn(async move {
-            // Provisioning that would take far longer than the shutdown budget.
-            let slow = async {
-                tokio::time::sleep(std::time::Duration::from_mins(1)).await;
-                Ok(())
-            };
-            super::run_or_roll_back(&cfg, &["supervisor-vm", "worker-vm"], cancel_rx, slow).await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        cancel.send_replace(true);
-        let error = creating.await?.err().ok_or("cancelled create must fail")?;
-        assert!(error.message.contains("cancelled"));
-        assert!(error.leaked_boxes.is_empty());
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        let kills = kills(&dir)?;
-        assert_eq!(kills.len(), 2);
-        assert!(kills.iter().any(|k| k.contains("supervisor-vm")));
-        assert!(kills.iter().any(|k| k.contains("worker-vm")));
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cancel_before_allocation_finishes_rolls_back_the_allocated_vms()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (cfg, dir) = fake_config("cancel-allocate")?;
-        let (_cancel, cancel_rx) = tokio::sync::watch::channel(true);
-        let error = super::allocate_pair(
-            &cfg,
-            serde_json::json!({}),
-            serde_json::json!({}),
-            cancel_rx,
-        )
-        .await
-        .err()
-        .ok_or("cancelled allocation must fail")?;
-        assert!(error.message.contains("cancelled"));
-        // Cancelled after the worker existed: the worker is killed, and the
-        // supervisor is never created.
-        let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
-        assert_eq!(calls.matches(r#""op": "create""#).count(), 1);
-        assert_eq!(kills(&dir)?.len(), 1);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn uncancelled_provisioning_kills_nothing() -> Result<(), Box<dyn std::error::Error>> {
-        let (cfg, dir) = fake_config("no-cancel")?;
-        let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
-        super::run_or_roll_back(&cfg, &["supervisor-vm", "worker-vm"], cancel_rx, async {
-            Ok(())
-        })
-        .await
-        .map_err(|e| e.message)?;
-        assert!(!dir.join("calls.jsonl").exists());
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rollback_kills_all_vms_at_once() -> Result<(), Box<dyn std::error::Error>> {
-        let (cfg, dir) = fake_config("rollback-parallel")?;
-        let rolling_back = tokio::spawn(async move {
-            super::rollback(&cfg, "cancelled".into(), &["stalled", "worker-vm"]).await
-        });
-        // The worker kill starts while the supervisor kill is still stalled.
-        let mut worker_killed = false;
-        for _ in 0..40 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if kills(&dir).is_ok_and(|k| k.iter().any(|l| l.contains("worker-vm"))) {
-                worker_killed = true;
-                break;
-            }
-        }
-        assert!(worker_killed && !rolling_back.is_finished());
-        assert!(rolling_back.await?.leaked_boxes.is_empty());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

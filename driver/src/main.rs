@@ -10,8 +10,9 @@
 //!   openshell-gateway  ──(gRPC over a Unix socket)──►  openshell-driver-e2b  ──►  E2B API
 //!        NVIDIA                                              ours
 //!
-//! The gateway is started with:
-//!   --compute-driver e2b --compute-driver-socket <path to our socket>
+//! The gateway selects it in `gateway.toml` (schema version 2):
+//!   `[openshell.gateway]`      `compute_driver = "e2b"`
+//!   `[openshell.drivers.e2b]`  `socket_path = "<path to our socket>"`
 //! and connects to the socket this program creates.
 //!
 //! WHY A UNIX SOCKET
