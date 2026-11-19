@@ -12,7 +12,7 @@ pub fn spawn(shared: Shared) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            let leaked: Vec<_> = shared.leaked.lock().await.iter().cloned().collect();
+            let leaked: Vec<_> = shared.leaked.lock().await.keys().cloned().collect();
             for id in leaked {
                 if shared.cfg.e2b.kill(&id).await.is_ok() {
                     shared.leaked.lock().await.remove(&id);

@@ -14,6 +14,8 @@ const fault = process.argv.includes('--fault')
 const keep = process.argv.includes('--keep')
 assert(!(fault && keep), '--fault and --keep cannot be combined')
 const name = `separated-${Date.now().toString(36)}`
+// OpenShell sandbox names are at most 19 characters.
+const racer = `cancel-${Date.now().toString(36)}`
 const results: { check: string; passed: true }[] = []
 const pass = (check: string) => { results.push({ check, passed: true }); console.log(`  ✓ ${check}`) }
 const step = (text: string) => console.log(`\n\x1b[1m${text}\x1b[0m`)
@@ -158,11 +160,36 @@ network_policies:
       const after = await run(worker, probe)
       assert.notEqual(after.exitCode, 0); assert.equal(after.stdout, '000')
       pass('Worker root egress remains denied after supervisor loss')
+
+      step('6. Delete during create — no VMs may be left behind')
+      let racingLog = ''
+      const racing = spawn('.bin/openshell', ['sandbox', 'create', '--name', racer, '--no-tty', '--', 'sleep', 'infinity'], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+      racing.stdout?.on('data', d => { racingLog += d.toString() })
+      racing.stderr?.on('data', d => { racingLog += d.toString() })
+      let allocated = 0
+      for (let i = 0; i < 60 && allocated === 0; i++) {
+        allocated = (await inventory(controlId)).filter(s => s.metadata['openshell.ai/sandbox-name'] === racer).length
+        if (allocated === 0) await sleep(500)
+      }
+      assert(allocated > 0, `The create never allocated a VM; the race was not exercised: ${racingLog}`)
+      await os(['sandbox', 'delete', racer], 120_000).catch(() => {})
+      racing.kill()
+      let leftover = allocated
+      for (let i = 0; i < 60 && leftover > 0; i++) {
+        await sleep(1_000)
+        leftover = (await inventory(controlId)).filter(s => s.metadata['openshell.ai/sandbox-name'] === racer).length
+      }
+      assert.equal(leftover, 0, 'VMs of a sandbox deleted during create must be rolled back')
+      const listed = await os(['sandbox', 'list'])
+      assert(!listed.split('\n').some(l => l.startsWith(racer + ' ')), 'Deleted sandbox must not remain listed')
+      // The v0.1.9 gateway holds the delete until the create returns, so this
+      // checks the end result, not the driver's cancel path (unit-tested).
+      pass(`Delete issued mid-create (${allocated} VM allocated): no VMs left behind`)
     }
     if (keep) {
       console.log(`\nTask retained for inspection: ${name}\nDelete: XDG_CONFIG_HOME=$PWD/.openshell-separated .bin/openshell sandbox delete ${name}`)
     } else {
-      step(`${fault ? '6' : '5'}. Delete task — both microVMs removed, control plane stays up`)
+      step(`${fault ? '7' : '5'}. Delete task — both microVMs removed, control plane stays up`)
       await os(['sandbox', 'delete', name])
       let remaining: string[] = ids
       for (let i = 0; i < 20; i++) {
@@ -186,7 +213,7 @@ network_policies:
       // On partial create, discover only this demo's pair for fallback cleanup.
       if (controlId) {
         const left = await inventory(controlId).catch(() => [])
-        for (const s of left.filter(s => s.metadata['openshell.ai/sandbox-name'] === name)) await Sandbox.kill(s.sandboxId)
+        for (const s of left.filter(s => [name, racer].includes(s.metadata['openshell.ai/sandbox-name']))) await Sandbox.kill(s.sandboxId)
       }
     }
     creator?.kill()
