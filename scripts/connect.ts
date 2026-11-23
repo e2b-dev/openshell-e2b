@@ -65,6 +65,18 @@ async function controlBox(): Promise<Sandbox> {
 }
 
 async function main() {
+  // Before changing anything locally or remotely: the status check at the
+  // end must talk through this run's own tunnel, not a leftover one, so
+  // refuse to start when the local tunnel port is already taken.
+  const portFree = await new Promise<boolean>((resolve) => {
+    const probe = createServer()
+    probe.once('error', () => { resolve(false) })
+    probe.listen(LOCAL_PORT, '127.0.0.1', () => { probe.close(() => { resolve(true) }) })
+  })
+  if (!portFree) {
+    throw new Error(`127.0.0.1:${LOCAL_PORT} is in use: stop the other \`npm run connect\` (or its wstunnel) first`)
+  }
+
   const sbx = await controlBox()
   const token = sbx.trafficAccessToken
   if (!token) throw new Error('control box is public; it must be private')
@@ -222,17 +234,6 @@ async function main() {
     log(`CLI: registered gateway '${GATEWAY_NAME}'`)
   }
 
-  // The status check below must talk through this run's own tunnel, not a
-  // leftover one: refuse to start when the local port is already taken.
-  const portFree = await new Promise<boolean>((resolve) => {
-    const probe = createServer()
-    probe.once('error', () => { resolve(false) })
-    probe.listen(LOCAL_PORT, '127.0.0.1', () => { probe.close(() => { resolve(true) }) })
-  })
-  if (!portFree) {
-    throw new Error(`127.0.0.1:${LOCAL_PORT} is in use: stop the other \`npm run connect\` (or its wstunnel) first`)
-  }
-
   // Open the tunnel on the laptop. 10 s heartbeat: spike A showed E2B's
   // proxy drops connections that stay silent for about a minute.
   const client = spawn(`${process.cwd()}/.bin/wstunnel`, [
@@ -253,14 +254,25 @@ async function main() {
     const line = String(d).trim()
     if (/error|failed|denied|refused|in use/i.test(line)) log('tunnel client:', line.slice(0, 300))
   })
+  // From here on, never leave the tunnel holding the port behind.
+  const stop = () => { client.kill(); process.exit(0) }
+  process.on('SIGINT', stop)
+  process.on('SIGTERM', stop)
+  client.on('exit', (code) => {
+    log('tunnel client exited', code)
+    process.exit(1)
+  })
   // End to end: an authenticated gateway call from the laptop CLI through
   // the tunnel. Fails loudly instead of reporting a gateway that is not usable.
   let status = ''
   for (let i = 0; i < 30; i++) {
     try {
-      status = execFileSync('.bin/openshell', ['status'], {
-        env: { ...process.env, XDG_CONFIG_HOME: CONFIG }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-      })
+      // This gateway, through this tunnel: explicit flags, and no inherited
+      // OPENSHELL_GATEWAY* variables pointing somewhere else.
+      const { OPENSHELL_GATEWAY: _g, OPENSHELL_GATEWAY_ENDPOINT: _e, ...env } = process.env
+      status = execFileSync('.bin/openshell', [
+        '--gateway', GATEWAY_NAME, '--gateway-endpoint', `https://127.0.0.1:${LOCAL_PORT}`, 'status',
+      ], { env: { ...env, XDG_CONFIG_HOME: CONFIG }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })
       if (/Status: Connected/.test(status) && /Authentication: Authenticated/.test(status)) break
     } catch (e) {
       status = String((e as { stdout?: string }).stdout ?? e)
@@ -273,11 +285,6 @@ async function main() {
   }
   log(`ready: laptop 127.0.0.1:${LOCAL_PORT} → gateway in ${sbx.sandboxId}`)
   log(`try:   XDG_CONFIG_HOME=${CONFIG} .bin/openshell status`)
-
-  const stop = () => { client.kill(); process.exit(0) }
-  process.on('SIGINT', stop)
-  process.on('SIGTERM', stop)
-  client.on('exit', (code) => { log('tunnel client exited', code); process.exit(1) })
 }
 
 main().catch((e) => { console.error(e.message ?? e); process.exit(1) })
