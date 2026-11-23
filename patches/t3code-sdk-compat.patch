@@ -1,0 +1,128 @@
+# Local compatibility patch for pingdotgg/t3code#32158 (commit fe9a70dc) against the real
+# @nvidia/openshell-sdk (0.1.7 and 0.1.9 behave the same). Applied by scripts/t3-smoke.ts to
+# .cache/t3code only; nothing here goes upstream without review.
+#
+# Four mismatches with the real SDK (T3's PR was tested against fakes only):
+#   1. oidcTokenProvider must be an object with getToken(), not a function
+#   2. sandboxTemplates is a property; list() pages (use listAll()); templates are { metadata, spec }
+#   3. createFromTemplate takes workloadTemplate, not template
+#   4. sandbox.listAll() has no label filter; filter on the client
+# One addition: with OPENSHELL_TLS_DIR set, connect with the mTLS client certificate the
+# SDK supports (caCert/clientCert/clientKey) and send no bearer token, like the gateway's CLI.
+diff --git a/packages/openshell/src/gatewayClient.ts b/packages/openshell/src/gatewayClient.ts
+index 5229f6a5..84a72466 100644
+--- a/packages/openshell/src/gatewayClient.ts
++++ b/packages/openshell/src/gatewayClient.ts
+@@ -135,7 +135,7 @@ interface OpenShellSdkClient {
+   sandbox: {
+     createFromTemplate(spec: Record<string, unknown>): Promise<OpenShellSdkSandbox>;
+     get(name: string): Promise<OpenShellSdkSandbox>;
+-    listAll(selector?: { labels?: Record<string, string> }): Promise<OpenShellSdkSandbox[]>;
++    listAll(): Promise<OpenShellSdkSandbox[]>;
+     delete(name: string, options?: Record<string, unknown>): Promise<string>;
+     waitReady(name: string, timeoutSecs: number): Promise<OpenShellSdkSandbox>;
+     exec(
+@@ -145,8 +145,8 @@ interface OpenShellSdkClient {
+     ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+     setPolicy(name: string, policy: unknown): Promise<unknown>;
+   };
+-  sandboxTemplates(): {
+-    list(): Promise<unknown[]>;
++  sandboxTemplates: {
++    listAll(): Promise<unknown[]>;
+     create(spec: Record<string, unknown>): Promise<unknown>;
+   };
+ }
+@@ -249,11 +249,27 @@ export const connectOpenShellGateway = async (
+       { cause },
+     );
+   }
++  // e2b compat: with OPENSHELL_TLS_DIR (ca.crt, tls.crt, tls.key), log in
++  // with an mTLS client certificate, which the SDK supports, and send no token.
++  const tlsDir = process.env.OPENSHELL_TLS_DIR;
++  const { readFileSync } = await import("node:fs");
+   const client = await sdk.OpenShellClient.connect({
+     gateway: options.gatewayUrl,
+-    ...(options.oidcTokenProvider === undefined
+-      ? {}
+-      : { oidcTokenProvider: options.oidcTokenProvider }),
++    ...(tlsDir
++      ? {
++          caCert: readFileSync(`${tlsDir}/ca.crt`),
++          clientCert: readFileSync(`${tlsDir}/tls.crt`),
++          clientKey: readFileSync(`${tlsDir}/tls.key`),
++        }
++      : options.oidcTokenProvider === undefined
++        ? {}
++        : {
++            // e2b compat: the SDK takes a provider object with getToken(), not a function.
++            oidcTokenProvider:
++              typeof options.oidcTokenProvider === "function"
++                ? { getToken: options.oidcTokenProvider }
++                : options.oidcTokenProvider,
++          }),
+   });
+   return {
+     health: async () => {
+@@ -262,7 +278,8 @@ export const connectOpenShellGateway = async (
+     createFromTemplate: async (spec) =>
+       toSandboxView(
+         await client.sandbox.createFromTemplate({
+-          template: spec.template,
++          // e2b compat: the SDK field is workloadTemplate.
++          workloadTemplate: spec.template,
+           ...(spec.name === undefined ? {} : { name: spec.name }),
+           ...(spec.labels === undefined ? {} : { labels: { ...spec.labels } }),
+           ...(spec.requestId === undefined ? {} : { request_id: spec.requestId }),
+@@ -277,12 +294,15 @@ export const connectOpenShellGateway = async (
+         return null;
+       }
+     },
++    // e2b compat: the SDK's listAll has no label filter; filter here.
+     listAll: async (selector) =>
+-      (
+-        await client.sandbox.listAll(
+-          selector === undefined ? undefined : { labels: { ...selector.labels } },
++      (await client.sandbox.listAll())
++        .filter((sandbox) =>
++          Object.entries(selector?.labels ?? {}).every(
++            ([key, value]) => sandbox.labels?.[key] === value,
++          ),
+         )
+-      ).map(toSandboxView),
++        .map(toSandboxView),
+     deleteSandbox: async (name, requestOptions) => {
+       const result = await client.sandbox.delete(
+         name,
+@@ -298,8 +318,21 @@ export const connectOpenShellGateway = async (
+     setPolicy: async (name, policy) => {
+       await client.sandbox.setPolicy(name, policy);
+     },
++    // e2b compat: sandboxTemplates is a property, list() pages, and templates
++    // come back as { metadata, spec }.
+     listTemplates: async () =>
+-      (await client.sandboxTemplates().list()).map((template) => templateFromUnknown(template)),
++      (await client.sandboxTemplates.listAll()).map((template) => {
++        const t = template as {
++          metadata?: { name?: string; labels?: Record<string, string> };
++          spec?: { workload?: { image?: string } };
++        };
++        const role = t.metadata?.labels?.[TEMPLATE_ROLE_LABEL];
++        return templateFromUnknown({
++          name: t.metadata?.name,
++          ...(t.spec?.workload?.image ? { image: t.spec.workload.image } : {}),
++          ...(role === "worker" || role === "managing" ? { role } : {}),
++        });
++      }),
+     createTemplate: async (spec) => {
+       const driverConfig =
+         spec.mounts === undefined || spec.mounts.length === 0
+@@ -325,7 +358,7 @@ export const connectOpenShellGateway = async (
+               },
+             };
+       return templateFromUnknown(
+-        await client.sandboxTemplates().create({
++        await client.sandboxTemplates.create({
+           name: spec.name,
+           ...(spec.image === undefined ? {} : { image: spec.image }),
+           ...(spec.cpu === undefined ? {} : { cpu: spec.cpu }),

@@ -22,7 +22,8 @@
     "demo:studio": "bash scripts/studio.sh",
     "demo:record": "bash scripts/studio.sh --record",
     "demo:dashboard": "bash scripts/dashboard.sh",
-    "demo:record:dashboard": "bash scripts/dashboard.sh --record"
+    "demo:record:dashboard": "bash scripts/dashboard.sh --record",
+    "t3:smoke": "tsx --env-file=.env scripts/t3-smoke.ts"
   },
   "dependencies": {
     "e2b": "^2.51.0",

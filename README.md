@@ -118,6 +118,19 @@ The left pane runs `studio create`, `studio fence`, `studio policy`, `studio req
 
 The recorder requires VHS, tmux, gum, FFmpeg and the Menlo font. It connects the gateway automatically, records the real commands, and accelerates the capture into a 45-second 1080p MP4. Export requires 14 live assertions plus GET-allow and POST-deny records from the supervisor feed. The full-speed capture, assertion report and source audit events are saved under `dist/studio/`. Detach with Ctrl-B, D to close the interactive studio; the launcher cleans up its task pair and any laptop tunnel it started. The shared control VM remains available. No other task pairs are removed.
 
+## T3 Code fleet smoke (end-to-end)
+
+[T3 Code's OpenShell fleet PR](https://github.com/pingdotgg/t3code/pull/32158) ships its own gateway smoke: connect, health, list templates, spawn a worker from a template, wait Ready, find it by fleet labels, delete it, check the fleet index. `npm run t3:smoke` runs that script against this gateway:
+
+```bash
+npm run t3:smoke -- --runs 3     # needs gh with read:packages and pnpm
+```
+
+- It fetches T3 at a pinned commit into `.cache/t3code` and installs `@nvidia/openshell-sdk` from GitHub Packages. The registry token is only in a temporary `.npmrc` during that install.
+- `patches/t3code-sdk-compat.patch` fixes four mismatches between T3's PR (tested only against fakes) and the real SDK, and lets T3's client log in with the mTLS client certificate that `npm run connect` writes, which the SDK supports. The patch header lists the changes. Nothing on the gateway side changes.
+- It uses a running `npm run connect` or starts one, and creates the `e2b-worker` gateway template from the worker template.
+- After each run, the harness checks that no E2B VM of the smoke remains. Timings go to `dist/t3-smoke.txt`.
+
 ## Build and test
 
 ```bash
