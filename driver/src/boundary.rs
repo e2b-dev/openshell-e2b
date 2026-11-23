@@ -90,6 +90,8 @@ pub struct E2bBoundarySpec {
     pub e2b_sandbox_id: String,
     pub template: String,
     pub fenced_interfaces: Vec<String>,
+    /// The worker was created with E2B internet access off.
+    pub host_egress_denied: bool,
     pub supervisor_tls: SandboxTlsClientConfig,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
@@ -111,7 +113,7 @@ impl E2bBoundarySpec {
             e2b_sandbox_id: &self.e2b_sandbox_id,
             network_namespace: "os",
             fenced_interfaces: &self.fenced_interfaces,
-            host_egress_denied: true,
+            host_egress_denied: self.host_egress_denied,
         }
         .project(&self.generation)?;
 
@@ -161,6 +163,13 @@ mod tests {
     use openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material;
 
     fn spec(fenced: &[&str]) -> Result<E2bBoundarySpec, Box<dyn std::error::Error>> {
+        spec_with_egress(fenced, true)
+    }
+
+    fn spec_with_egress(
+        fenced: &[&str],
+        host_egress_denied: bool,
+    ) -> Result<E2bBoundarySpec, Box<dyn std::error::Error>> {
         let session_id = SandboxSessionId::new();
         let tls = generate_sandbox_tls_material(session_id)?;
         Ok(E2bBoundarySpec {
@@ -177,6 +186,7 @@ mod tests {
             e2b_sandbox_id: "e2b-worker".into(),
             template: "openshell-workload".into(),
             fenced_interfaces: fenced.iter().map(ToString::to_string).collect(),
+            host_egress_denied,
             supervisor_tls: SandboxTlsClientConfig {
                 server_name: tls.server_name,
                 trust_anchor_pem: tls.trust_anchor_pem,
@@ -208,6 +218,12 @@ mod tests {
             provisioned.boundary_config.listener,
             BoundaryListener::RuntimeInitiatedUnix { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_worker_created_with_internet_access() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(spec_with_egress(&["lo"], false)?.provision().is_err());
         Ok(())
     }
 

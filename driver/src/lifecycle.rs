@@ -293,6 +293,7 @@ async fn provision_and_start(
         e2b_sandbox_id: e2b_id.to_string(),
         template: cfg.template.clone(),
         fenced_interfaces,
+        host_egress_denied: !boxed.allow_internet_access,
         supervisor_tls: SandboxTlsClientConfig {
             server_name: tls.server_name.clone(),
             trust_anchor_pem: tls.trust_anchor_pem.clone(),
