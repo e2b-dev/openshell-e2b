@@ -8,17 +8,37 @@ use openshell_core::proto::compute::v1::{
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// Retry every leaked-set entry once. An entry goes when its cleanup works,
+/// except a sweep key, which stays until its grace period has passed.
+pub async fn retry_leaked(shared: &Shared) {
+    let leaked: Vec<_> = shared.leaked.lock().await.keys().cloned().collect();
+    for key in leaked {
+        // A sweep that started before the deadline may have listed E2B too
+        // early; only a clean sweep that started after it ends the grace.
+        let started = std::time::Instant::now();
+        if lifecycle::retry_cleanup(&shared.cfg, &key).await.is_err() {
+            continue;
+        }
+        let in_grace = shared
+            .sweep_until
+            .lock()
+            .is_ok_and(|until| until.get(&key).is_some_and(|deadline| started < *deadline));
+        if in_grace {
+            continue;
+        }
+        if let Ok(mut until) = shared.sweep_until.lock() {
+            until.remove(&key);
+        }
+        shared.leaked.lock().await.remove(&key);
+        info!(entry = %key, "health: rollback cleaned up");
+    }
+}
+
 pub fn spawn(shared: Shared) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            let leaked: Vec<_> = shared.leaked.lock().await.iter().cloned().collect();
-            for id in leaked {
-                if shared.cfg.e2b.kill(&id).await.is_ok() {
-                    shared.leaked.lock().await.remove(&id);
-                    info!(e2b = %id, "health: rollback cleaned up");
-                }
-            }
+            retry_leaked(&shared).await;
             let snapshot: Vec<_> = shared
                 .sandboxes
                 .lock()

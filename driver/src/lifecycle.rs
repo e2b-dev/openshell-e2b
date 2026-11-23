@@ -21,6 +21,7 @@ use openshell_sandbox_backend::boundary_protocol::{
 use rand::RngCore;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tokio::sync::watch;
 
 use tracing::{info, warn};
 
@@ -59,11 +60,15 @@ pub struct Running {
     pub deleting: bool,
 }
 
-/// Why a create failed, and the E2B box it could not roll back (if any), so
-/// the caller can keep retrying that kill instead of losing track of it.
+/// Why a create failed, and what its rollback left: boxes it could not kill
+/// (the caller keeps retrying those), how many it did remove, and whether
+/// VMs that only E2B knows about may still exist (a create call failed after
+/// E2B may have allocated the VM).
 pub struct CreateError {
     pub message: String,
     pub leaked_boxes: Vec<String>,
+    pub removed: usize,
+    pub sweep_pending: bool,
 }
 
 impl From<String> for CreateError {
@@ -71,7 +76,69 @@ impl From<String> for CreateError {
         Self {
             message,
             leaked_boxes: Vec::new(),
+            removed: 0,
+            sweep_pending: false,
         }
+    }
+}
+
+/// VM ids a create owns, recorded the moment E2B returns each one. Shared
+/// with the driver task that awaits the create, so a panic mid-create still
+/// leaves a list of what to roll back.
+#[derive(Clone, Default)]
+pub struct Allocations(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Allocations {
+    pub(crate) fn record(&self, id: &str) {
+        if let Ok(mut ids) = self.0.lock() {
+            ids.push(id.to_owned());
+        }
+    }
+
+    /// Ids recorded so far (a poisoned lock still yields its contents).
+    pub fn snapshot(&self) -> Vec<String> {
+        match self.0.lock() {
+            Ok(ids) => ids.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// Leaked-set key for "VMs of this sandbox may exist that we have no id for".
+const SWEEP_PREFIX: &str = "sweep:";
+
+/// How long after a failed E2B create the driver keeps sweeping for VMs that
+/// E2B may still finish creating (a timed-out or lost reply).
+pub const SWEEP_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
+
+pub fn sweep_key(sandbox_id: &str) -> String {
+    format!("{SWEEP_PREFIX}{sandbox_id}")
+}
+
+/// Kill every VM this driver tagged with `sandbox_id`. Returns how many E2B
+/// removed; an error means the lookup or a kill failed and must be retried.
+pub async fn sweep(cfg: &Config, sandbox_id: &str) -> Result<usize, String> {
+    let ids = cfg
+        .e2b
+        .list_ids_matching(serde_json::json!({
+            "openshell.ai/driver-owner": cfg.owner,
+            "openshell.ai/sandbox-id": sandbox_id,
+        }))
+        .await?;
+    let mut removed = 0;
+    for id in ids {
+        if cfg.e2b.kill_reporting(&id).await? {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Retry one leaked-set entry: a VM id, or a sweep key.
+pub async fn retry_cleanup(cfg: &Config, key: &str) -> Result<(), String> {
+    match key.strip_prefix(SWEEP_PREFIX) {
+        Some(sandbox_id) => sweep(cfg, sandbox_id).await.map(|_| ()),
+        None => cfg.e2b.kill(key).await,
     }
 }
 
@@ -155,7 +222,14 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, CreateError> {
+/// Create and start one task pair. `cancel` (delete or shutdown) stops it at
+/// the next step and rolls back whatever it allocated.
+pub async fn create(
+    cfg: &Config,
+    sandbox: &DriverSandbox,
+    cancel: watch::Receiver<bool>,
+    allocations: &Allocations,
+) -> Result<Running, CreateError> {
     let spec = sandbox
         .spec
         .as_ref()
@@ -179,33 +253,30 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, Cr
             "openshell.ai/role": role,
         })
     };
-    // Create B first, then A. Every failure rolls back everything allocated.
-    let worker = cfg
-        .e2b
-        .create(&cfg.template, metadata("worker"), false)
-        .await?;
-    let supervisor = match cfg
-        .e2b
-        .create(&cfg.supervisor_template, metadata("supervisor"), true)
-        .await
-    {
-        Ok(created) => created,
-        Err(message) => return Err(rollback(cfg, message, &[&worker.sandbox_id]).await),
-    };
-    info!(sandbox = %sandbox.name, worker = %worker.sandbox_id, supervisor = %supervisor.sandbox_id, "E2B task pair created");
-    if let Err(message) = provision_and_start(
+    let (worker, supervisor) = allocate_pair(
         cfg,
-        sandbox,
-        &auth,
-        session_id,
-        &generation,
-        &worker,
-        &supervisor,
+        &sandbox.id,
+        [metadata("worker"), metadata("supervisor")],
+        cancel.clone(),
+        allocations,
     )
-    .await
-    {
-        return Err(rollback(cfg, message, &[&supervisor.sandbox_id, &worker.sandbox_id]).await);
-    }
+    .await?;
+    info!(sandbox = %sandbox.name, worker = %worker.sandbox_id, supervisor = %supervisor.sandbox_id, "E2B task pair created");
+    run_or_roll_back(
+        cfg,
+        &[&supervisor.sandbox_id, &worker.sandbox_id],
+        cancel,
+        provision_and_start(
+            cfg,
+            sandbox,
+            &auth,
+            session_id,
+            &generation,
+            &worker,
+            &supervisor,
+        ),
+    )
+    .await?;
     Ok(Running {
         sandbox: DriverSandbox {
             status: Some(status(
@@ -222,17 +293,113 @@ pub async fn create(cfg: &Config, sandbox: &DriverSandbox) -> Result<Running, Cr
     })
 }
 
-async fn rollback(cfg: &Config, message: String, ids: &[&str]) -> CreateError {
+const CANCELLED: &str = "create cancelled (sandbox deleted or driver stopping)";
+
+/// Create B first, then A. A failure or a cancel after either create kills
+/// what exists. An E2B create already in flight is never abandoned: its VM
+/// id would be lost.
+async fn allocate_pair(
+    cfg: &Config,
+    sandbox_id: &str,
+    [worker_metadata, supervisor_metadata]: [serde_json::Value; 2],
+    cancel: watch::Receiver<bool>,
+    allocations: &Allocations,
+) -> Result<(crate::e2b::Created, crate::e2b::Created), CreateError> {
+    // Already cancelled (e.g. shutdown began): allocate nothing.
+    if *cancel.borrow() {
+        return Err(CANCELLED.to_owned().into());
+    }
+    let worker = match cfg.e2b.create(&cfg.template, worker_metadata, false).await {
+        Ok(created) => created,
+        Err(message) => return Err(after_failed_create(cfg, sandbox_id, message, &[]).await),
+    };
+    allocations.record(&worker.sandbox_id);
+    if *cancel.borrow() {
+        return Err(rollback(cfg, CANCELLED.into(), &[&worker.sandbox_id]).await);
+    }
+    let supervisor = match cfg
+        .e2b
+        .create(&cfg.supervisor_template, supervisor_metadata, true)
+        .await
+    {
+        Ok(created) => created,
+        Err(message) => {
+            return Err(after_failed_create(cfg, sandbox_id, message, &[&worker.sandbox_id]).await);
+        }
+    };
+    allocations.record(&supervisor.sandbox_id);
+    if *cancel.borrow() {
+        let ids = [supervisor.sandbox_id.as_str(), worker.sandbox_id.as_str()];
+        return Err(rollback(cfg, CANCELLED.into(), &ids).await);
+    }
+    Ok((worker, supervisor))
+}
+
+/// An E2B create call failed. E2B may still have allocated the VM (a lost or
+/// malformed reply), or may still be creating it (a timed-out reply). Remove
+/// the known ids and anything already tagged with this sandbox now, and keep
+/// the sweep pending: the health loop repeats it until `SWEEP_GRACE` passes.
+async fn after_failed_create(
+    cfg: &Config,
+    sandbox_id: &str,
+    message: String,
+    known: &[&str],
+) -> CreateError {
+    let mut error = rollback(cfg, message, known).await;
+    match sweep(cfg, sandbox_id).await {
+        Ok(removed) => error.removed += removed,
+        Err(sweep_error) => {
+            warn!(sandbox_id, %sweep_error, "sweep after a failed create failed; health monitor will retry");
+        }
+    }
+    error.sweep_pending = true;
+    error
+}
+
+/// Run `work` until it finishes or `cancel` fires. On an error or a cancel,
+/// kill `ids`. Dropping `work` mid-way is safe: every VM it touches is in `ids`.
+async fn run_or_roll_back(
+    cfg: &Config,
+    ids: &[&str],
+    mut cancel: watch::Receiver<bool>,
+    work: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), CreateError> {
+    let cancelled = async {
+        // A dropped sender means nobody can cancel any more.
+        if cancel.wait_for(|c| *c).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let outcome = tokio::select! {
+        result = work => result,
+        () = cancelled => Err(CANCELLED.into()),
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(message) => Err(rollback(cfg, message, ids).await),
+    }
+}
+
+/// Kill every VM at once, so one stalled kill cannot hold back the others.
+pub async fn rollback(cfg: &Config, message: String, ids: &[&str]) -> CreateError {
+    let results = futures::future::join_all(ids.iter().map(|id| cfg.e2b.kill_reporting(id))).await;
     let mut leaked_boxes = Vec::new();
-    for id in ids {
-        if let Err(error) = cfg.e2b.kill(id).await {
-            warn!(e2b = %id, %error, "rollback failed; health monitor will retry");
-            leaked_boxes.push((*id).to_owned());
+    let mut removed = 0;
+    for (id, result) in ids.iter().zip(results) {
+        match result {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(e2b = %id, %error, "rollback failed; health monitor will retry");
+                leaked_boxes.push((*id).to_owned());
+            }
         }
     }
     CreateError {
         message,
         leaked_boxes,
+        removed,
+        sweep_pending: false,
     }
 }
 
@@ -525,20 +692,32 @@ fn child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> {
 }
 
 /// Attempt both deletes even if one fails. Retain the record for safe retry.
+/// Returns how many of the two E2B actually removed.
 pub async fn delete(
     cfg: &Config,
     sandbox_id: &str,
     worker: &str,
     supervisor: &str,
-) -> Result<(), String> {
-    let results: [Result<(), String>; 2] =
-        tokio::join!(cfg.e2b.kill(supervisor), cfg.e2b.kill(worker)).into();
-    let failures: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+) -> Result<usize, String> {
+    let results: [Result<bool, String>; 2] = tokio::join!(
+        cfg.e2b.kill_reporting(supervisor),
+        cfg.e2b.kill_reporting(worker)
+    )
+    .into();
+    let mut removed = 0;
+    let mut failures = Vec::new();
+    for result in results {
+        match result {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(error) => failures.push(error),
+        }
+    }
     if !failures.is_empty() {
         return Err(failures.join("; "));
     }
     info!(sandbox_id, worker, supervisor, "task pair deleted");
-    Ok(())
+    Ok(removed)
 }
 
 /// Requests this driver cannot honour. Rejected up front rather than silently
@@ -592,7 +771,7 @@ fn check_identity(sandbox: &DriverSandbox) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::private_dir;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -634,7 +813,12 @@ mod tests {
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&target);
     }
-    fn fake_config(
+    /// A Config whose E2B helper is a Python fake that logs every call to
+    /// calls.jsonl. Special inputs: sandboxId "unreachable" fails, "stalled"
+    /// kills after 3 s; template "slow" creates after 1 s, "lost" reports an
+    /// error after E2B "allocated" lost-vm; list returns listed.json and fails
+    /// while list-fails exists; a `run` of "sleep" records its pid and sleeps.
+    pub fn fake_config(
         name: &str,
     ) -> Result<(super::Config, std::path::PathBuf), Box<dyn std::error::Error>> {
         let dir = scratch(name);
@@ -648,8 +832,33 @@ req = json.load(sys.stdin)
 root = pathlib.Path(__file__).parent
 with (root / 'calls.jsonl').open('a') as f:
     f.write(json.dumps({'op': sys.argv[1], **req}) + '\n')
-if req.get('sandboxId') == 'unreachable':
+import os, time
+op = sys.argv[1]
+if req.get('sandboxId', '').startswith('gone'):
+    print(json.dumps({'ok': True, 'killed': False}))
+elif req.get('sandboxId') == 'unreachable':
     print(json.dumps({'ok': False, 'error': 'injected API failure'}))
+elif req.get('sandboxId') == 'stalled':
+    time.sleep(3)
+    print(json.dumps({'ok': True, 'killed': True}))
+elif op == 'create' and req['template'] == 'lost':
+    print(json.dumps({'ok': False, 'error': 'reply lost after allocation'}))
+elif op == 'create':
+    if req['template'] == 'slow':
+        time.sleep(1)
+    sid = req['template'] + '-vm'
+    print(json.dumps({'ok': True, 'sandboxId': sid, 'trafficAccessToken': 't', 'host9000': 'h',
+                      'allowInternetAccess': req.get('allowInternetAccess', False)}))
+elif op == 'list':
+    if (root / 'list-fails').exists():
+        print(json.dumps({'ok': False, 'error': 'list unavailable'}))
+    else:
+        listed = root / 'listed.json'
+        print(json.dumps({'ok': True, 'sandboxes': json.loads(listed.read_text()) if listed.exists() else []}))
+elif op == 'run' and req.get('cmd') == 'sleep':
+    (root / 'run.pid').write_text(str(os.getpid()))
+    time.sleep(30)
+    print(json.dumps({'ok': True, 'exitCode': 0, 'stdout': '', 'stderr': ''}))
 else:
     print(json.dumps({'ok': True, 'killed': True}))
 ",
@@ -690,6 +899,227 @@ else:
         let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
         assert_eq!(calls.lines().count(), 2);
         assert!(calls.contains("worker") && calls.contains("unreachable"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    fn kills(dir: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(std::fs::read_to_string(dir.join("calls.jsonl"))?
+            .lines()
+            .filter(|l| l.contains(r#""op": "kill""#))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn cancel_during_provisioning_kills_both_vms_promptly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("cancel-provision")?;
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        let creating = tokio::spawn(async move {
+            // Provisioning that would take far longer than the shutdown budget.
+            let slow = async {
+                tokio::time::sleep(std::time::Duration::from_mins(1)).await;
+                Ok(())
+            };
+            super::run_or_roll_back(&cfg, &["supervisor-vm", "worker-vm"], cancel_rx, slow).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.send_replace(true);
+        let error = creating.await?.err().ok_or("cancelled create must fail")?;
+        assert!(error.message.contains("cancelled"));
+        assert!(error.leaked_boxes.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let kills = kills(&dir)?;
+        assert_eq!(kills.len(), 2);
+        assert!(kills.iter().any(|k| k.contains("supervisor-vm")));
+        assert!(kills.iter().any(|k| k.contains("worker-vm")));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    fn calls(dir: &std::path::Path, op: &str) -> usize {
+        std::fs::read_to_string(dir.join("calls.jsonl"))
+            .map_or(0, |c| c.matches(&format!(r#""op": "{op}""#)).count())
+    }
+
+    #[tokio::test]
+    async fn an_already_cancelled_create_allocates_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("cancel-first")?;
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(true);
+        let allocations = super::Allocations::default();
+        let error = super::allocate_pair(
+            &cfg,
+            "sbx",
+            [serde_json::json!({}), serde_json::json!({})],
+            cancel_rx,
+            &allocations,
+        )
+        .await
+        .err()
+        .ok_or("cancelled allocation must fail")?;
+        assert!(error.message.contains("cancelled"));
+        assert_eq!(calls(&dir, "create"), 0);
+        assert!(allocations.snapshot().is_empty());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_an_outstanding_create_rolls_that_vm_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut cfg, dir) = fake_config("cancel-outstanding")?;
+        cfg.template = "slow".into();
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let allocations = super::Allocations::default();
+        let recorded = allocations.clone();
+        let creating = tokio::spawn(async move {
+            super::allocate_pair(
+                &cfg,
+                "sbx",
+                [serde_json::json!({}), serde_json::json!({})],
+                cancel_rx,
+                &allocations,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.send_replace(true);
+        let error = creating
+            .await?
+            .err()
+            .ok_or("cancelled allocation must fail")?;
+        assert!(error.message.contains("cancelled"));
+        // The outstanding create was awaited for its id, recorded, then killed;
+        // the supervisor was never created.
+        assert_eq!(calls(&dir, "create"), 1);
+        assert_eq!(recorded.snapshot(), vec!["slow-vm"]);
+        assert_eq!(error.removed, 1);
+        assert!(kills(&dir)?.iter().any(|k| k.contains("slow-vm")));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lost_create_reply_is_swept_by_tag() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut cfg, dir) = fake_config("lost-reply")?;
+        cfg.template = "lost".into();
+        std::fs::write(dir.join("listed.json"), r#"[{"sandboxId": "lost-vm"}]"#)?;
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let error = super::allocate_pair(
+            &cfg,
+            "sbx",
+            [serde_json::json!({}), serde_json::json!({})],
+            cancel_rx,
+            &super::Allocations::default(),
+        )
+        .await
+        .err()
+        .ok_or("a failed create must fail")?;
+        assert!(error.message.contains("reply lost"));
+        // E2B may still create a VM later: the sweep stays pending.
+        assert!(error.sweep_pending);
+        assert_eq!(error.removed, 1);
+        let log = std::fs::read_to_string(dir.join("calls.jsonl"))?;
+        assert!(log.contains(r#""openshell.ai/sandbox-id": "sbx""#));
+        assert!(kills(&dir)?.iter().any(|k| k.contains("lost-vm")));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sweep_stays_pending_when_the_lookup_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut cfg, dir) = fake_config("lost-reply-no-list")?;
+        cfg.template = "lost".into();
+        std::fs::write(dir.join("list-fails"), "")?;
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let error = super::allocate_pair(
+            &cfg,
+            "sbx",
+            [serde_json::json!({}), serde_json::json!({})],
+            cancel_rx,
+            &super::Allocations::default(),
+        )
+        .await
+        .err()
+        .ok_or("a failed create must fail")?;
+        assert!(error.sweep_pending);
+        // The health loop retries the sweep through this key.
+        std::fs::remove_file(dir.join("list-fails"))?;
+        assert!(
+            super::retry_cleanup(&cfg, &super::sweep_key("sbx"))
+                .await
+                .is_ok()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_helper_call_kills_its_process() -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("kill-on-drop")?;
+        let e2b = cfg.e2b.clone();
+        let call = tokio::spawn(async move { e2b.run("vm", "sleep", "root").await });
+        let pid_file = dir.join("run.pid");
+        for _ in 0..50 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+        call.abort();
+        let mut alive = true;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // SAFETY: signal 0 only checks that the process exists.
+            alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+        }
+        assert!(
+            !alive,
+            "helper process {pid} kept running after its call was cancelled"
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncancelled_provisioning_kills_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("no-cancel")?;
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        super::run_or_roll_back(&cfg, &["supervisor-vm", "worker-vm"], cancel_rx, async {
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.message)?;
+        assert!(!dir.join("calls.jsonl").exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_kills_all_vms_at_once() -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = fake_config("rollback-parallel")?;
+        let rolling_back = tokio::spawn(async move {
+            super::rollback(&cfg, "cancelled".into(), &["stalled", "worker-vm"]).await
+        });
+        // The worker kill starts while the supervisor kill is still stalled.
+        let mut worker_killed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if kills(&dir).is_ok_and(|k| k.iter().any(|l| l.contains("worker-vm"))) {
+                worker_killed = true;
+                break;
+            }
+        }
+        assert!(worker_killed && !rolling_back.is_finished());
+        assert!(rolling_back.await?.leaked_boxes.is_empty());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
