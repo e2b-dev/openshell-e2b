@@ -5,7 +5,9 @@
 //   /opt/openshell/wstunnel            reverse-tunnel server (supervisor → this VM)
 //   /opt/openshell/launch-sandbox.sh   builds the network fence and starts the runtime
 //   user "sandbox" uid/gid 1500        the identity the agent runs as
+//   user "tunnel"  uid/gid 1501        runs the tunnel server, apart from the agent
 //   /.openshell/channel/sandbox        where the driver writes this session's files
+//   /.openshell/channel/control        the tunnel server's socket, reachable by gid 1500
 //
 // Build after `npm run build:binaries`:  npm run template:workload
 import { Template, defaultBuildLogger } from 'e2b'
@@ -20,9 +22,12 @@ export const template = Template({ fileContextPath: process.cwd() })
   .runCmd([
     `curl -fsSL ${WSTUNNEL_LINUX} | tar xz -C /opt/openshell wstunnel && chmod 755 /opt/openshell/wstunnel`,
     'groupadd -g 1500 sandbox && useradd -u 1500 -g 1500 -M -d /sandbox -s /bin/bash sandbox',
+    'groupadd -g 1501 tunnel && useradd -u 1501 -g 1501 -M -d /nonexistent -s /usr/sbin/nologin tunnel',
     // Driver-owned directories: the capability-free runtime cannot create these itself.
     'install -d -m 0755 -o root -g root /.openshell /.openshell/channel',
     'install -d -m 0700 -o 1500 -g 1500 /.openshell/channel/sandbox /sandbox',
+    // setgid: the socket the tunnel user creates here gets group 1500.
+    'install -d -m 2710 -o 1501 -g 1500 /.openshell/channel/control',
   ], { user: 'root' })
 
 await Template.build(template, TEMPLATES.workload, {

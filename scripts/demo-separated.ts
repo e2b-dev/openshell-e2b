@@ -90,7 +90,16 @@ async function main() {
     pass('Gateway Ready with a distinct supervisor/worker pair')
     const supervisor = await Sandbox.connect(a.sandboxId)
     const worker = await Sandbox.connect(b.sandboxId)
-    assert.equal((await run(supervisor, 'test -f /run/openshell-task/ready && kill -0 $(cat /run/openshell-task/supervisor.pid)')).exitCode, 0)
+    // The gateway can report Ready (supervisor connected) a moment before the
+    // launcher writes its ready marker, so wait for it briefly.
+    let supervisorUp = false
+    for (let i = 0; i < 40 && !supervisorUp; i++) {
+      const state = await run(supervisor, 'cd /run/openshell-task; if [ -f failed ]; then cat failed; exit 2; fi; test -f ready && kill -0 $(cat supervisor.pid)')
+      if (state.exitCode === 2) throw new Error(`supervisor launcher failed: ${state.stdout}`)
+      supervisorUp = state.exitCode === 0
+      if (!supervisorUp) await sleep(500)
+    }
+    assert(supervisorUp, 'supervisor ready marker did not appear within 20 s')
     assert.equal((await run(worker, 'test ! -e /opt/openshell/openshell-supervisor && test ! -e /run/openshell-task/auth.json')).exitCode, 0)
     for (const sbx of [supervisor, worker]) {
       assert.equal((await run(sbx, 'test -z "$E2B_API_KEY" && test ! -f /home/user/openshell/driver.env')).exitCode, 0)
@@ -99,6 +108,15 @@ async function main() {
     // Supervisors authenticate with their own launch JWT; no shared client certificate.
     assert.equal((await run(supervisor, 'test -s /run/openshell-task/auth.json && ! ls /run/openshell-task | grep -q client')).exitCode, 0)
     pass('Supervisor holds its own launch JWT and no gateway client certificate')
+    // The worker's tunnel server runs as its own uid; the workload uid can't
+    // read or change its rules, but its group reaches the control socket.
+    const tunnelLayout = await run(worker, [
+      '[ "$(ps -o user= -C wstunnel | sort -u)" = "tunnel" ]',
+      '! setpriv --reuid=1500 --regid=1500 --clear-groups cat /run/openshell-tunnel/rules.yaml >/dev/null 2>&1',
+      '[ "$(stat -c %G /.openshell/channel/control/control.sock)" = "sandbox" ]',
+    ].join(' && '))
+    assert.equal(tunnelLayout.exitCode, 0, `worker tunnel layout: ${tunnelLayout.stdout}${tunnelLayout.stderr}`)
+    pass('Worker tunnel runs as its own uid; the workload uid cannot read its rules')
     console.log((await inside('printf "  Agent uid="; id -u; grep -E "^(CapEff|NoNewPrivs)" /proc/self/status')).trim())
 
     step('3. Two enforcement layers — OpenShell policy + E2B worker egress fence')

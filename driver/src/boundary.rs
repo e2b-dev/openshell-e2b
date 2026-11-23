@@ -1,8 +1,12 @@
 //! The two launch descriptors for one sandbox, built with NVIDIA's own types.
 //!
-//! This is the only module that builds `OpenShell` boundary types. Keep it
-//! small: the next breaking upstream release (0.2.0) should only touch this
-//! file and `service.rs`.
+//! This module owns the paired `BoundaryConfig` and `SandboxRuntimeDescriptor`
+//! and the fence evidence they share; `provision()` is their single point of
+//! construction. Other upstream types are used elsewhere too: `lifecycle.rs`
+//! decodes the launch authentication, generates the session TLS material,
+//! resolves the workload identity and sets the supervisor environment, and
+//! `service.rs`, `health.rs` and `main.rs` use the compute-driver protocol
+//! types. Expect a breaking upstream release (0.2.0) to touch all of them.
 //!
 //! Modeled on NVIDIA's Docker driver (`crates/openshell-driver-docker/src/isolation.rs`,
 //! Apache-2.0). Same shape, different evidence: Docker proves "the workload
@@ -41,7 +45,9 @@ use std::path::PathBuf;
 
 /// Paths inside the worker VM (created by the workload template).
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
-pub const CONTROL_SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
+/// The worker's tunnel server (uid 1501) listens here; the runtime (uid 1500)
+/// dials it. Its own directory, separate from the runtime's private files.
+pub const CONTROL_SOCKET_PATH: &str = "/.openshell/channel/control/control.sock";
 pub const SERVER_CERT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 pub const SERVER_KEY_PATH: &str = "/.openshell/channel/sandbox/server.key";
 
@@ -90,6 +96,8 @@ pub struct E2bBoundarySpec {
     pub e2b_sandbox_id: String,
     pub template: String,
     pub fenced_interfaces: Vec<String>,
+    /// The worker was created with E2B internet access off.
+    pub host_egress_denied: bool,
     pub supervisor_tls: SandboxTlsClientConfig,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
@@ -111,7 +119,7 @@ impl E2bBoundarySpec {
             e2b_sandbox_id: &self.e2b_sandbox_id,
             network_namespace: "os",
             fenced_interfaces: &self.fenced_interfaces,
-            host_egress_denied: true,
+            host_egress_denied: self.host_egress_denied,
         }
         .project(&self.generation)?;
 
@@ -161,6 +169,13 @@ mod tests {
     use openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material;
 
     fn spec(fenced: &[&str]) -> Result<E2bBoundarySpec, Box<dyn std::error::Error>> {
+        spec_with_egress(fenced, true)
+    }
+
+    fn spec_with_egress(
+        fenced: &[&str],
+        host_egress_denied: bool,
+    ) -> Result<E2bBoundarySpec, Box<dyn std::error::Error>> {
         let session_id = SandboxSessionId::new();
         let tls = generate_sandbox_tls_material(session_id)?;
         Ok(E2bBoundarySpec {
@@ -177,6 +192,7 @@ mod tests {
             e2b_sandbox_id: "e2b-worker".into(),
             template: "openshell-workload".into(),
             fenced_interfaces: fenced.iter().map(ToString::to_string).collect(),
+            host_egress_denied,
             supervisor_tls: SandboxTlsClientConfig {
                 server_name: tls.server_name,
                 trust_anchor_pem: tls.trust_anchor_pem,
@@ -208,6 +224,12 @@ mod tests {
             provisioned.boundary_config.listener,
             BoundaryListener::RuntimeInitiatedUnix { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_worker_created_with_internet_access() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(spec_with_egress(&["lo"], false)?.provision().is_err());
         Ok(())
     }
 

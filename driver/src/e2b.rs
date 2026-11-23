@@ -26,6 +26,8 @@ pub struct Created {
     pub traffic_access_token: String,
     /// Public hostname for port 9000, e.g. `9000-<id>.e2b.app`.
     pub host9000: String,
+    /// The `allowInternetAccess` value E2B received for this VM.
+    pub allow_internet_access: bool,
 }
 
 #[derive(Debug, Deserialize)]

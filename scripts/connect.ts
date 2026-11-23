@@ -133,14 +133,21 @@ async function main() {
   // Long-running programs: each is its own E2B background command, tracked by
   // a PID file (matching by name is fragile: a script mentioning "wstunnel
   // server" matches `pkill -f "wstunnel server"` too).
-  const daemon = async (name: string, cmd: string, restart = false) => {
+  // `ready` is a shell test that passes once the new process serves.
+  const daemon = async (name: string, cmd: string, restart = false, ready?: string) => {
     const alive = await sbx.commands.run(
       `test -f ${STATE}/run/${name}.pid && kill -0 $(cat ${STATE}/run/${name}.pid) 2>/dev/null && echo yes || echo no`,
     )
     if (alive.stdout.trim() === 'yes') {
       if (!restart) return log(`${name}: already running`)
-      await sbx.commands.run(`kill $(cat ${STATE}/run/${name}.pid) || true`)
-      await sleep(500)
+      // Wait until the old process is gone: the driver takes up to 15 s to
+      // clean up and removes its socket file on exit, which would otherwise
+      // delete the socket its replacement just created.
+      await sbx.commands.run(
+        `pid=$(cat ${STATE}/run/${name}.pid); kill $pid 2>/dev/null; ` +
+        'for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.2; done; exit 1',
+        { timeoutMs: 30_000 },
+      ).catch(() => { throw new Error(`${name}: old process did not exit within 20 s`) })
     }
     // timeoutMs: 0 matters. The SDK's default is 60 s even for background
     // commands, so without it E2B kills the gateway after one minute.
@@ -149,7 +156,14 @@ async function main() {
       { background: true, timeoutMs: 0 },
     )
     await handle.disconnect()
-    await sleep(1000)
+    if (ready) {
+      await sbx.commands.run(
+        `for i in $(seq 100); do ${ready} && exit 0; sleep 0.2; done; tail -5 ${STATE}/${name}.log >&2; exit 1`,
+        { timeoutMs: 30_000 },
+      ).catch(() => { throw new Error(`${name}: did not come up; see ${STATE}/${name}.log`) })
+    } else {
+      await sleep(1000)
+    }
     log(`${name}: started`)
   }
   // Persist the transport path: reconnecting a laptop must not invalidate
@@ -174,8 +188,9 @@ async function main() {
     `--helper ${ROOT}/helper/e2b-helper.ts --node ${ROOT}/node/bin/node ` +
     `--gateway-tunnel ${STATE}/gateway-tunnel.json --state-dir ${STATE}/sandboxes ` +
     `--gateway-ca ${STATE}/pki/ca.crt'`,
-    restart)
-  await daemon('gateway', `${ROOT}/bin/openshell-gateway --config ${STATE}/gateway.toml`, restart)
+    restart, `test -S ${STATE}/run/e2b.sock`)
+  await daemon('gateway', `${ROOT}/bin/openshell-gateway --config ${STATE}/gateway.toml`, restart,
+    `(exec 3<>/dev/tcp/127.0.0.1/${GATEWAY_PORT}) 2>/dev/null`)
 
   // `gateway add --local` requires the client certificates to exist already.
   const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`

@@ -11,7 +11,7 @@
 //
 // Build after `npm run build:binaries`:  npm run template:control
 import { Template, defaultBuildLogger } from 'e2b'
-import { DIST, OPENSHELL_RELEASE, TEMPLATES, WSTUNNEL_LINUX } from '../scripts/openshell.ts'
+import { DIST, TEMPLATES, WSTUNNEL_LINUX, verifiedRelease } from '../scripts/openshell.ts'
 
 const NODE = 'v24.22.1'
 const ROOT = '/opt/openshell-e2b'
@@ -22,7 +22,7 @@ export const template = Template({ fileContextPath: process.cwd() })
   .copy(`${DIST}/openshell-driver-e2b`, `${ROOT}/bin/openshell-driver-e2b`, { mode: 0o755, user: 'root' })
   .copy('driver/e2b-helper.ts', `${ROOT}/helper/e2b-helper.ts`, { mode: 0o644, user: 'root' })
   .runCmd([
-    `curl -fsSL ${OPENSHELL_RELEASE}/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz | tar xz -C ${ROOT}/bin`,
+    verifiedRelease('openshell-gateway-x86_64-unknown-linux-gnu.tar.gz', 'openshell-gateway-checksums-sha256.txt', `${ROOT}/bin`),
     `curl -fsSL ${WSTUNNEL_LINUX} | tar xz -C ${ROOT}/bin wstunnel`,
     `chmod 755 ${ROOT}/bin/*`,
     `mkdir -p ${ROOT}/node && curl -fsSL https://nodejs.org/dist/${NODE}/node-${NODE}-linux-x64.tar.xz | tar xJ -C ${ROOT}/node --strip-components=1`,

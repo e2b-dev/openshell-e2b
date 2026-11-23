@@ -13,7 +13,7 @@
 // so it is part of the trusted control plane.
 //
 // Ops:
-//   create  {template, metadata, timeoutMs, allowInternetAccess} → {sandboxId, trafficAccessToken, host9000}
+//   create  {template, metadata, timeoutMs, allowInternetAccess} → {sandboxId, trafficAccessToken, host9000, allowInternetAccess}
 //   write   {sandboxId, path, base64, user, mode?}               → {}
 //   run     {sandboxId, cmd, user, background?, timeoutMs?}      → {exitCode, stdout, stderr} | {pid}
 //   kill    {sandboxId}                                          → {killed}
@@ -35,13 +35,21 @@ async function readStdin(): Promise<Request> {
 
 const ops: Record<string, (req: any) => Promise<object>> = {
   async create({ template, metadata = {}, timeoutMs = 60 * 60_000, allowInternetAccess = false }) {
-    const sbx = await Sandbox.create(template, {
+    // One options object: the egress setting the driver records as evidence
+    // is the one E2B received.
+    const options = {
       metadata,
       timeoutMs,
-      allowInternetAccess,
+      allowInternetAccess: allowInternetAccess === true,
       network: { allowPublicTraffic: false },
-    })
-    return { sandboxId: sbx.sandboxId, trafficAccessToken: sbx.trafficAccessToken, host9000: sbx.getHost(TUNNEL_PORT) }
+    }
+    const sbx = await Sandbox.create(template, options)
+    return {
+      sandboxId: sbx.sandboxId,
+      trafficAccessToken: sbx.trafficAccessToken,
+      host9000: sbx.getHost(TUNNEL_PORT),
+      allowInternetAccess: options.allowInternetAccess,
+    }
   },
 
   async write({ sandboxId, path, base64, user = 'root', mode }) {

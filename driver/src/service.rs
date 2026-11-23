@@ -152,8 +152,13 @@ impl E2bDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: self.cfg.template.clone(),
-            // The gateway decides when to create/stop/delete; we just do it.
-            gateway_manages_lifecycle: true,
+            // True would make the gateway stop every running sandbox on its
+            // shutdown and start them again on startup. Stop/Start are not
+            // implemented yet, so a gateway restart would fail them. With
+            // false, a gateway-only restart finds the pairs again through
+            // List/Watch; a driver restart reaps its VMs and the gateway
+            // prunes the missing records. Revisit with stop/start (step 2).
+            gateway_manages_lifecycle: false,
             supports_sandbox_authentication: false,
             // "Ready" is declared by the gateway when the supervisor connects,
             // not by us. That's the safer choice: ready means policed.
