@@ -359,13 +359,23 @@ impl ComputeDriver for E2bDriver {
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let id = request.into_inner().sandbox_id;
         // Clone and release the lock right away; never hold it across awaits.
-        let sandbox = self
+        let running = self
             .sandboxes
             .lock()
             .await
             .get(&id)
-            .map(|running| running.sandbox.clone())
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            .map(|running| running.sandbox.clone());
+        let Some(sandbox) = running else {
+            // VMs of this sandbox may still exist (failed rollback, or a
+            // sweep in its grace period). NOT_FOUND would make the gateway
+            // drop its record after a retryable delete; say "retry" instead.
+            if self.shared.leaked.lock().await.values().any(|s| s == &id) {
+                return Err(Status::unavailable(
+                    "sandbox VMs are still being removed; retry",
+                ));
+            }
+            return Err(Status::not_found("sandbox not found"));
+        };
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
         }))
@@ -810,6 +820,37 @@ mod tests {
             "the record still goes"
         );
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    async fn get(
+        driver: &E2bDriver,
+    ) -> Result<tonic::Response<super::GetSandboxResponse>, tonic::Status> {
+        driver
+            .get_sandbox(Request::new(super::GetSandboxRequest {
+                sandbox_id: "sbx".into(),
+                ..Default::default()
+            }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn get_says_retry_while_cleanup_is_pending() -> Result<(), Box<dyn std::error::Error>> {
+        let driver = driver();
+        assert_eq!(
+            get(&driver).await.err().ok_or("must fail")?.code(),
+            tonic::Code::NotFound
+        );
+        driver
+            .shared
+            .leaked
+            .lock()
+            .await
+            .insert(crate::lifecycle::sweep_key("sbx"), "sbx".into());
+        assert_eq!(
+            get(&driver).await.err().ok_or("must fail")?.code(),
+            tonic::Code::Unavailable
+        );
         Ok(())
     }
 

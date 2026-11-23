@@ -13,14 +13,16 @@ use tracing::{info, warn};
 pub async fn retry_leaked(shared: &Shared) {
     let leaked: Vec<_> = shared.leaked.lock().await.keys().cloned().collect();
     for key in leaked {
+        // A sweep that started before the deadline may have listed E2B too
+        // early; only a clean sweep that started after it ends the grace.
+        let started = std::time::Instant::now();
         if lifecycle::retry_cleanup(&shared.cfg, &key).await.is_err() {
             continue;
         }
-        let in_grace = shared.sweep_until.lock().is_ok_and(|until| {
-            until
-                .get(&key)
-                .is_some_and(|deadline| std::time::Instant::now() < *deadline)
-        });
+        let in_grace = shared
+            .sweep_until
+            .lock()
+            .is_ok_and(|until| until.get(&key).is_some_and(|deadline| started < *deadline));
         if in_grace {
             continue;
         }
