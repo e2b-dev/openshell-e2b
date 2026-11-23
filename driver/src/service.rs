@@ -81,28 +81,149 @@ pub struct PendingCreate {
     /// Delete or shutdown sends `true`. Provisioning stops at its next step
     /// and rolls its VMs back instead of publishing them.
     pub cancel: watch::Sender<bool>,
-    /// `Some` once the create has finished. For a create that was not
-    /// published: `Ok` when none of its VMs remain, `Err` when a kill failed
-    /// (the VMs are then in the leaked set, retried by the health loop).
-    pub done: watch::Receiver<Option<Result<(), String>>>,
+    /// `Some` once the create has finished.
+    pub done: watch::Receiver<Option<Cleanup>>,
 }
+
+/// How a create that was not published ended: `Ok(n)` when none of its VMs
+/// remain (`n` of them were removed by the rollback), `Err` when some may
+/// remain (they are in the leaked set, retried by the health loop).
+pub type Cleanup = Result<usize, String>;
 
 impl PendingCreate {
     /// Cancel and return a handle to wait for the outcome.
-    pub fn cancel(&self) -> watch::Receiver<Option<Result<(), String>>> {
+    pub fn cancel(&self) -> watch::Receiver<Option<Cleanup>> {
         self.cancel.send_replace(true);
         self.done.clone()
     }
 }
 
 /// Wait for a cancelled create to finish and report whether its VMs are gone.
-pub async fn wait_cancelled(
-    mut done: watch::Receiver<Option<Result<(), String>>>,
-) -> Result<(), String> {
+pub async fn wait_cancelled(mut done: watch::Receiver<Option<Cleanup>>) -> Cleanup {
     done.wait_for(Option::is_some).await.map_or_else(
         |_| Err("create task ended without reporting its outcome".to_owned()),
-        |outcome| outcome.clone().unwrap_or(Ok(())),
+        |outcome| outcome.clone().unwrap_or(Ok(0)),
     )
+}
+
+/// One create, start to finish, in a driver-owned task: provision, then
+/// publish it or (cancelled, failed, panicked) roll it back, and wake any
+/// delete or shutdown waiting on it.
+async fn run_create(
+    shared: Shared,
+    sandbox: openshell_core::proto::compute::v1::DriverSandbox,
+    cancel_rx: watch::Receiver<bool>,
+    done_tx: watch::Sender<Option<Cleanup>>,
+) -> Result<String, String> {
+    let id = sandbox.id.clone();
+    let allocations = lifecycle::Allocations::default();
+    // The create runs in its own task. If it panics, this task still
+    // knows every VM it allocated and finishes the cleanup.
+    let work = {
+        let (cfg, sandbox, allocations) =
+            (shared.cfg.clone(), sandbox.clone(), allocations.clone());
+        tokio::spawn(
+            async move { lifecycle::create(&cfg, &sandbox, cancel_rx, &allocations).await },
+        )
+    };
+    let result = match work.await {
+        Ok(result) => result,
+        Err(panic) => Err(roll_back_panicked(&shared.cfg, &id, &allocations, &panic).await),
+    };
+    // Decide under the `pending` lock, so a delete sees this sandbox
+    // either as pending or in the table, never as neither.
+    let mut pending = shared.pending.lock().await;
+    let cancelled = pending.get(&id).is_some_and(|p| *p.cancel.borrow());
+    let (outcome, cleanup) = match result {
+        Ok(running) if cancelled => {
+            // Cancelled after provisioning finished: never publish.
+            // The pending entry stays while the rollback runs.
+            drop(pending);
+            let ids = [running.e2b_id, running.supervisor_id];
+            let cleanup = lifecycle::delete(&shared.cfg, &id, &ids[0], &ids[1]).await;
+            if let Err(error) = &cleanup {
+                tracing::warn!(%error, "rollback of cancelled create failed; health monitor will retry");
+                shared
+                    .leaked
+                    .lock()
+                    .await
+                    .extend(ids.map(|vm| (vm, id.clone())));
+            }
+            pending = shared.pending.lock().await;
+            (
+                Err("sandbox was deleted while it was being created".to_owned()),
+                cleanup,
+            )
+        }
+        Ok(running) => {
+            let runtime_identity = running.e2b_id.clone();
+            // Insert and announce under one lock, so a watcher that
+            // snapshots the table (also under the lock) sees it either way.
+            let mut table = shared.sandboxes.lock().await;
+            shared.announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
+                sandbox: Some(running.sandbox.clone()),
+            }));
+            table.insert(id.clone(), running);
+            drop(table);
+            (Ok(runtime_identity), Ok(0))
+        }
+        Err(error) => {
+            // lifecycle::create already rolled back; anything it could
+            // not kill, or could not look up, is handed to the health
+            // loop before we let go of the reservation.
+            let mut leaked = shared.leaked.lock().await;
+            let cleanup = if error.leaked_boxes.is_empty() && !error.sweep_pending {
+                Ok(error.removed)
+            } else {
+                Err(format!(
+                    "rollback incomplete: kill failed for {:?}{}",
+                    error.leaked_boxes,
+                    if error.sweep_pending {
+                        ", tag sweep pending"
+                    } else {
+                        ""
+                    }
+                ))
+            };
+            leaked.extend(error.leaked_boxes.into_iter().map(|vm| (vm, id.clone())));
+            if error.sweep_pending {
+                leaked.insert(lifecycle::sweep_key(&id), id.clone());
+            }
+            drop(leaked);
+            (Err(error.message), cleanup)
+        }
+    };
+    // A delete cancelled this create and VMs were really removed:
+    // tell watchers before the id can be created again.
+    if cancelled && matches!(cleanup, Ok(removed) if removed > 0) {
+        shared.announce(Payload::Deleted(WatchSandboxesDeletedEvent {
+            sandbox_id: id.clone(),
+        }));
+    }
+    pending.remove(&id);
+    drop(pending);
+    // Wake any delete or shutdown waiting for this create.
+    done_tx.send_replace(Some(cleanup));
+    outcome
+}
+
+/// The create task panicked: kill what it recorded, and sweep by tag in case
+/// an E2B create call was still in flight.
+async fn roll_back_panicked(
+    cfg: &Config,
+    sandbox_id: &str,
+    allocations: &lifecycle::Allocations,
+    panic: &tokio::task::JoinError,
+) -> lifecycle::CreateError {
+    tracing::error!(sandbox_id, %panic, "create task panicked; rolling back its VMs");
+    let ids = allocations.snapshot();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let mut error = lifecycle::rollback(cfg, format!("create failed: {panic}"), &refs).await;
+    match lifecycle::sweep(cfg, sandbox_id).await {
+        Ok(removed) => error.removed += removed,
+        Err(_) => error.sweep_pending = true,
+    }
+    error
 }
 
 pub struct E2bDriver {
@@ -288,68 +409,7 @@ impl ComputeDriver for E2bDriver {
         // The work runs in a driver-owned task: if the gateway cancels this
         // request, provisioning still finishes (and is tracked) or rolls back.
         let shared = self.shared.clone();
-        let task = tokio::spawn(async move {
-            let id = sandbox.id.clone();
-            let result = lifecycle::create(&shared.cfg, &sandbox, cancel_rx).await;
-            // Decide under the `pending` lock, so a delete sees this sandbox
-            // either as pending or in the table, never as neither.
-            let mut pending = shared.pending.lock().await;
-            let cancelled = pending.get(&id).is_some_and(|p| *p.cancel.borrow());
-            let (outcome, cleanup) = match result {
-                Ok(running) if cancelled => {
-                    // Cancelled after provisioning finished: never publish.
-                    // The pending entry stays while the rollback runs.
-                    drop(pending);
-                    let ids = [running.e2b_id, running.supervisor_id];
-                    let cleanup = lifecycle::delete(&shared.cfg, &id, &ids[0], &ids[1]).await;
-                    if let Err(error) = &cleanup {
-                        tracing::warn!(%error, "rollback of cancelled create failed; health monitor will retry");
-                        shared
-                            .leaked
-                            .lock()
-                            .await
-                            .extend(ids.map(|vm| (vm, id.clone())));
-                    }
-                    pending = shared.pending.lock().await;
-                    (
-                        Err("sandbox was deleted while it was being created".to_owned()),
-                        cleanup,
-                    )
-                }
-                Ok(running) => {
-                    let runtime_identity = running.e2b_id.clone();
-                    // Insert and announce under one lock, so a watcher that
-                    // snapshots the table (also under the lock) sees it either way.
-                    let mut table = shared.sandboxes.lock().await;
-                    shared.announce(Payload::Sandbox(WatchSandboxesSandboxEvent {
-                        sandbox: Some(running.sandbox.clone()),
-                    }));
-                    table.insert(id.clone(), running);
-                    drop(table);
-                    (Ok(runtime_identity), Ok(()))
-                }
-                Err(error) => {
-                    // lifecycle::create already rolled back; anything it could
-                    // not kill is handed to the health loop before we let go.
-                    let cleanup = if error.leaked_boxes.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(format!("could not kill {:?}", error.leaked_boxes))
-                    };
-                    shared
-                        .leaked
-                        .lock()
-                        .await
-                        .extend(error.leaked_boxes.into_iter().map(|vm| (vm, id.clone())));
-                    (Err(error.message), cleanup)
-                }
-            };
-            pending.remove(&id);
-            drop(pending);
-            // Wake any delete or shutdown waiting for this create.
-            done_tx.send_replace(Some(cleanup));
-            outcome
-        });
+        let task = tokio::spawn(run_create(shared, sandbox, cancel_rx, done_tx));
         let runtime_identity = task
             .await
             .map_err(|e| Status::internal(format!("create task failed: {e}")))?
@@ -399,8 +459,12 @@ impl ComputeDriver for E2bDriver {
             .get(&id)
             .map(PendingCreate::cancel);
         if let Some(done) = in_flight {
+            // `deleted` says whether this request removed a platform resource:
+            // false when the create had not allocated anything yet.
             return match wait_cancelled(done).await {
-                Ok(()) => Ok(Response::new(DeleteSandboxResponse { deleted: true })),
+                Ok(removed) => Ok(Response::new(DeleteSandboxResponse {
+                    deleted: removed > 0,
+                })),
                 Err(error) => Err(Status::unavailable(format!(
                     "delete not confirmed, retry: {error}"
                 ))),
@@ -442,7 +506,7 @@ impl ComputeDriver for E2bDriver {
             let mut table = shared.sandboxes.lock().await;
             match &result {
                 // Only now, after E2B confirmed, the record goes away.
-                Ok(()) => {
+                Ok(_) => {
                     table.remove(&id);
                     shared.announce(Payload::Deleted(WatchSandboxesDeletedEvent {
                         sandbox_id: id,
@@ -544,10 +608,7 @@ mod tests {
     /// Register a fake in-flight create; returns its cancel receiver and done sender.
     async fn in_flight(
         driver: &E2bDriver,
-    ) -> (
-        watch::Receiver<bool>,
-        watch::Sender<Option<Result<(), String>>>,
-    ) {
+    ) -> (watch::Receiver<bool>, watch::Sender<Option<super::Cleanup>>) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (done_tx, done_rx) = watch::channel(None);
         driver.shared.pending.lock().await.insert(
@@ -587,7 +648,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!first.is_finished() && !second.is_finished());
         driver.shared.pending.lock().await.remove("sbx");
-        done.send_replace(Some(Ok(())));
+        done.send_replace(Some(Ok(2)));
         assert!(first.await??.into_inner().deleted);
         assert!(second.await??.into_inner().deleted);
         Ok(())
@@ -634,6 +695,45 @@ mod tests {
             .ok_or("create must be refused")?;
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(driver.shared.pending.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_create_that_allocated_nothing_reports_nothing_deleted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let driver = Arc::new(driver());
+        let (_cancel, done) = in_flight(&driver).await;
+        let deleting = delete(&driver);
+        tokio::task::yield_now().await;
+        driver.shared.pending.lock().await.remove("sbx");
+        done.send_replace(Some(Ok(0)));
+        assert!(!deleting.await??.into_inner().deleted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_panicked_create_rolls_back_what_it_recorded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = crate::lifecycle::tests::fake_config("panic-rollback")?;
+        let allocations = crate::lifecycle::Allocations::default();
+        let recorder = allocations.clone();
+        let panicked = tokio::spawn(async move {
+            recorder.record("worker-vm");
+            panic!("injected panic after the first allocation");
+        })
+        .await
+        .err()
+        .ok_or("the task must panic")?;
+        let error = super::roll_back_panicked(&cfg, "sbx", &allocations, &panicked).await;
+        assert!(error.message.contains("panic"));
+        assert!(error.leaked_boxes.is_empty() && !error.sweep_pending);
+        let log = std::fs::read_to_string(dir.join("calls.jsonl"))?;
+        assert!(log.contains(r#""op": "kill", "sandboxId": "worker-vm""#));
+        assert!(
+            log.contains(r#""openshell.ai/sandbox-id": "sbx""#),
+            "swept by tag too"
+        );
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

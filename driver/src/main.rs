@@ -186,9 +186,11 @@ async fn shutdown(shared: service::Shared) {
             kills.push(tokio::spawn(async move { e2b.kill(&id).await }));
         }
     }
-    for box_id in leaked {
-        let e2b = shared.cfg.e2b.clone();
-        kills.push(tokio::spawn(async move { e2b.kill(&box_id).await }));
+    for key in leaked {
+        let cfg = shared.cfg.clone();
+        kills.push(tokio::spawn(async move {
+            lifecycle::retry_cleanup(&cfg, &key).await
+        }));
     }
     for kill in kills {
         let _ = kill.await;

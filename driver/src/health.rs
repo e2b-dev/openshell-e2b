@@ -14,7 +14,7 @@ pub fn spawn(shared: Shared) {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let leaked: Vec<_> = shared.leaked.lock().await.keys().cloned().collect();
             for id in leaked {
-                if shared.cfg.e2b.kill(&id).await.is_ok() {
+                if lifecycle::retry_cleanup(&shared.cfg, &id).await.is_ok() {
                     shared.leaked.lock().await.remove(&id);
                     info!(e2b = %id, "health: rollback cleaned up");
                 }

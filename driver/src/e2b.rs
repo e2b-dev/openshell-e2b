@@ -46,6 +46,9 @@ impl E2b {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // A cancelled call (dropped future) must not leave its node
+            // process running against VMs that are being rolled back.
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("start e2b helper: {e}"))?;
         let mut stdin = child.stdin.take().ok_or("e2b helper has no stdin")?;
@@ -136,6 +139,15 @@ impl E2b {
 
     /// Ids of the running boxes this driver instance owns (by metadata tag).
     pub async fn list_ids(&self, owner: &str) -> Result<std::collections::HashSet<String>, String> {
+        self.list_ids_matching(json!({ "openshell.ai/driver-owner": owner }))
+            .await
+    }
+
+    /// Ids of the running boxes whose metadata contains every given pair.
+    pub async fn list_ids_matching(
+        &self,
+        metadata: Value,
+    ) -> Result<std::collections::HashSet<String>, String> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Item {
@@ -145,17 +157,22 @@ impl E2b {
         struct Listed {
             sandboxes: Vec<Item>,
         }
-        let listed: Listed = self
-            .call(
-                "list",
-                json!({ "metadata": { "openshell.ai/driver-owner": owner } }),
-            )
-            .await?;
+        let listed: Listed = self.call("list", json!({ "metadata": metadata })).await?;
         Ok(listed.sandboxes.into_iter().map(|i| i.sandbox_id).collect())
     }
 
     pub async fn kill(&self, id: &str) -> Result<(), String> {
-        let _: Value = self.call("kill", json!({ "sandboxId": id })).await?;
-        Ok(())
+        self.kill_reporting(id).await.map(|_| ())
+    }
+
+    /// Kill a box; `Ok(true)` when E2B removed one, `Ok(false)` when it was
+    /// already gone.
+    pub async fn kill_reporting(&self, id: &str) -> Result<bool, String> {
+        #[derive(Deserialize)]
+        struct Killed {
+            killed: bool,
+        }
+        let killed: Killed = self.call("kill", json!({ "sandboxId": id })).await?;
+        Ok(killed.killed)
     }
 }
