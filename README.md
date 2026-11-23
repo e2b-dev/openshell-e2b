@@ -21,7 +21,7 @@ This is a live demo integration built on OpenShell **v0.1.9** (`OPENSHELL_VERSIO
                        Separate guest kernels; task pair destroyed together
 ```
 
-A opens two authenticated WSS tunnels through E2B's port proxy: one to the shared gateway, and one reverse tunnel to B. In B, the reverse tunnel listens on the runtime's control socket. As OpenShell requires since v0.1.7, B's runtime dials the supervisor through that socket, and the session channel is OpenShell's own pinned TLS on top. An agent's DNS/TCP/HTTP requests travel from B over that channel to A; A applies OpenShell policy and opens the approved upstream connection. **The network connection always goes from A to B, so B never needs any outbound network.** This uses the existing public E2B HTTPS transport with private ingress tokens, not private VPC peering.
+A opens two authenticated WSS tunnels through E2B's port proxy: one to the shared gateway, and one reverse tunnel to B. In B, the reverse tunnel listens on the runtime's control socket. Like the upstream drivers since OpenShell v0.1.6, this driver has B's runtime dial the supervisor (v0.1.9 still accepts the older direction) through that socket, and the session channel is OpenShell's own pinned TLS on top. An agent's DNS/TCP/HTTP requests travel from B over that channel to A; A applies OpenShell policy and opens the approved upstream connection. **The network connection always goes from A to B, so B never needs any outbound network.** This uses the existing public E2B HTTPS transport with private ingress tokens, not private VPC peering.
 
 Supervisors verify the gateway with its CA and authenticate with their own per-task launch JWT. They hold no client certificate.
 
@@ -139,16 +139,17 @@ For incremental development, `build:binaries -- --keep-builder` retains the comp
 ### Upgrading OpenShell
 
 1. Set the new tag in `OPENSHELL_VERSION` and in the three crate tags in `driver/Cargo.toml`. `build:binaries` refuses to run if they disagree.
-2. `cd driver && cargo update -p openshell-core && cargo clippy --all-targets && cargo test`. Upstream type changes land in `boundary.rs` and `service.rs`.
+2. `cd driver && cargo update -p openshell-core && cargo clippy --all-targets && cargo test`. Upstream type changes land mostly in `boundary.rs`, `lifecycle.rs` and `service.rs`.
 3. If the patched build is still needed, check that `patches/landlock-abi2.patch` applies to the new tag.
-4. Rebuild the binaries and all three templates, then run `npm run demo:verify`.
+4. Rebuild the binaries and all three templates, and run `npm run setup` for the matching laptop CLI.
+5. Start a new control VM with `npm run connect -- --new`, then run `npm run demo:verify`. `RESTART=1` is not enough: it restarts the binaries already in the existing control VM, and a driver restart removes its running sandboxes.
 
 ## Implementation boundaries
 
 | Component | Responsibility |
 |---|---|
 | `driver/src/lifecycle.rs` | Create the pair, configure worker isolation, provision task credentials in A, start the supervisor; roll back both on failure |
-| `driver/src/boundary.rs` | The only module that builds NVIDIA boundary types: descriptors, runtime-initiated transport, fence evidence |
+| `driver/src/boundary.rs` | The paired NVIDIA descriptors, runtime-initiated transport and fence evidence |
 | `driver/src/health.rs` | Check both VMs and A's process tree; report failed readiness; retry failed rollback deletes |
 | `driver/e2b-helper.ts` | E2B SDK operations; private ingress for both roles, internet disabled for workers |
 | `templates/launch-supervisor.py` | A's supervisor, gateway tunnel and reverse worker tunnel; stop the group if any process exits |
@@ -161,7 +162,7 @@ The worker keeps OpenShell's Landlock, seccomp, namespace and executable-identit
 ## Demo limitations and production work
 
 - **Landlock ABI v2 patch:** the worker kernel is Linux 6.1. The default build patches OpenShell to accept ABI v2, which does not protect read-only files against truncate. This is not full OpenShell filesystem-policy equivalence. The stock build (`OPENSHELL_LANDLOCK_ABI2=0`) needs Linux 6.2 or newer.
-- **Control-plane persistence:** driver inventory is in memory. Restarting the driver reaps its metadata-tagged task VMs instead of adopting them. Stop/start and suspend/resume (`SuspendSandbox`, E2B pause) are not implemented yet.
+- **Control-plane persistence:** driver inventory is in memory. Restarting the driver reaps its metadata-tagged task VMs instead of adopting them; the gateway then prunes the missing sandboxes on its next reconcile (records older than about five minutes). A gateway-only restart keeps running sandboxes: the driver reports them again. Stop/start and suspend/resume (`SuspendSandbox`, E2B pause) are not implemented yet, so the driver tells the gateway not to stop and start sandboxes across its own restarts (`gateway_manages_lifecycle = false`).
 - **Isolation backends:** the driver uses the stock OpenShell runtime and rejects an operator-selected external isolation backend.
 - **Lifetimes:** task VMs and the demo control VM have a one-hour TTL. Create a fresh control plane shortly before presenting.
 - **Network transport:** WSS through E2B's ingress proxy adds hops. Private sandbox-to-sandbox transport and narrower supervisor egress are future improvements. The external worker fence is configured at create time; the fence evidence records this configuration rather than a platform-signed attestation.

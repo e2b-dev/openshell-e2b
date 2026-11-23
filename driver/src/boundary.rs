@@ -1,8 +1,12 @@
 //! The two launch descriptors for one sandbox, built with NVIDIA's own types.
 //!
-//! This is the only module that builds `OpenShell` boundary types. Keep it
-//! small: the next breaking upstream release (0.2.0) should only touch this
-//! file and `service.rs`.
+//! This module owns the paired `BoundaryConfig` and `SandboxRuntimeDescriptor`
+//! and the fence evidence they share; `provision()` is their single point of
+//! construction. Other upstream types are used elsewhere too: `lifecycle.rs`
+//! decodes the launch authentication, generates the session TLS material,
+//! resolves the workload identity and sets the supervisor environment, and
+//! `service.rs`, `health.rs` and `main.rs` use the compute-driver protocol
+//! types. Expect a breaking upstream release (0.2.0) to touch all of them.
 //!
 //! Modeled on NVIDIA's Docker driver (`crates/openshell-driver-docker/src/isolation.rs`,
 //! Apache-2.0). Same shape, different evidence: Docker proves "the workload
