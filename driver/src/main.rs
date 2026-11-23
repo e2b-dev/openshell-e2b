@@ -100,12 +100,8 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::new(&args.log_level))
         .init();
 
-    // Create the private socket file. `SocketCleanup` deletes it again when
-    // the program exits, so a restart doesn't fail on "address in use".
     // Refuse to start on a state directory another user could tamper with.
     lifecycle::private_dir(&args.state_dir).map_err(|e| miette::miette!(e))?;
-    let listener = bind_private(&args.bind_socket).map_err(|e| miette::miette!(e))?;
-    let cleanup = SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), template = %args.template, owner = %args.owner, "starting E2B compute driver");
 
     // Serve NVIDIA's ComputeDriver gRPC interface (defined in their
@@ -135,6 +131,12 @@ async fn main() -> Result<()> {
     {
         config.e2b.kill(&id).await.map_err(|e| miette::miette!(e))?;
     }
+    // Create the private socket file only now, after the startup sweep, so
+    // its existence means this driver is ready to serve. `SocketCleanup`
+    // deletes it again when the program exits, so a restart doesn't fail on
+    // "address in use".
+    let listener = bind_private(&args.bind_socket).map_err(|e| miette::miette!(e))?;
+    let cleanup = SocketCleanup::new(args.bind_socket.clone());
     let driver = service::E2bDriver::new(config);
     let shared = driver.shared();
     let server = tonic::transport::Server::builder()
