@@ -11,7 +11,7 @@
 //!   `CreateSandbox`                     E2B box + fence + runtime + supervisor ✅ (lifecycle.rs)
 //!   Get / List / `WatchSandboxes`       from our in-memory table              ✅
 //!   `DeleteSandbox`                     stop supervisor + tunnel, kill E2B box ✅
-//!   Stop / Start                      "not implemented yet"                 ⏳
+//!   Stop / Start / Suspend            "not implemented yet"                 ⏳
 //!
 //! State lives in memory. If the driver restarts, it forgets its sandboxes
 //! (the E2B boxes stay tagged with metadata, so they can be found and cleaned).
@@ -27,10 +27,10 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event::Payload,
+    StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event::Payload,
 };
 use openshell_core::resource_admission::{DriverAdmissionConfig, ResourceAdmissionConfig};
 use std::collections::{HashMap, HashSet};
@@ -42,7 +42,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
 pub const DRIVER_NAME: &str = "e2b";
-const IMPLEMENTATION: &str = "sudolabs/openshell-driver-e2b";
+const IMPLEMENTATION: &str = "e2b-dev/openshell-driver-e2b";
 
 /// State shared by the gRPC handlers, the driver-owned create/delete tasks,
 /// the health loop and the shutdown path.
@@ -114,8 +114,13 @@ impl E2bDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: self.cfg.template.clone(),
-            // The gateway decides when to create/stop/delete; we just do it.
-            gateway_manages_lifecycle: true,
+            // True would make the gateway stop every running sandbox on its
+            // shutdown and start them again on startup. Stop/Start are not
+            // implemented yet, so a gateway restart would fail them. With
+            // false, a gateway-only restart finds the pairs again through
+            // List/Watch; a driver restart reaps its VMs and the gateway
+            // prunes the missing records. Revisit with stop/start (step 2).
+            gateway_manages_lifecycle: false,
             supports_sandbox_authentication: false,
             // "Ready" is declared by the gateway when the supervisor connects,
             // not by us. That's the safer choice: ready means policed.
@@ -274,6 +279,15 @@ impl ComputeDriver for E2bDriver {
     ) -> Result<Response<StartSandboxResponse>, Status> {
         Err(Status::unimplemented(
             "e2b driver: start not implemented yet",
+        ))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "e2b driver: suspend not implemented yet",
         ))
     }
 

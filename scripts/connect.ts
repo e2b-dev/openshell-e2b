@@ -17,6 +17,7 @@
 //   2. wstunnel only accepts our random path and only forwards to the gateway port
 //   3. the tunnel client verifies E2B's TLS certificate (otherwise 1 and 2 could be intercepted)
 //   4. inside the tunnel, the CLI and gateway speak mutual TLS end to end
+//      (supervisors use the same tunnel server with server-verified TLS + their launch JWT)
 //
 // Keeps running (it holds the tunnel open). Ctrl-C to stop; the control box keeps running.
 // Note: on a team with a 1-hour sandbox cap the control box dies an hour after creation;
@@ -24,8 +25,10 @@
 import { randomBytes } from 'node:crypto'
 import { execFileSync, spawn } from 'node:child_process'
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Sandbox } from 'e2b'
+import { TEMPLATES } from './openshell.ts'
 
 const GATEWAY_PORT = 17670 // gateway inside the control box (localhost only)
 const TUNNEL_PORT = 9000 // the only port we use through E2B's proxy
@@ -51,7 +54,7 @@ async function controlBox(): Promise<Sandbox> {
       }
     }
   }
-  const sbx = await Sandbox.create('openshell-control-separated', {
+  const sbx = await Sandbox.create(TEMPLATES.control, {
     timeoutMs: 60 * 60_000,
     network: { allowPublicTraffic: false },
     metadata: { 'openshell.ai/role': 'control-plane' },
@@ -62,6 +65,18 @@ async function controlBox(): Promise<Sandbox> {
 }
 
 async function main() {
+  // Before changing anything locally or remotely: the status check at the
+  // end must talk through this run's own tunnel, not a leftover one, so
+  // refuse to start when the local tunnel port is already taken.
+  const portFree = await new Promise<boolean>((resolve) => {
+    const probe = createServer()
+    probe.once('error', () => { resolve(false) })
+    probe.listen(LOCAL_PORT, '127.0.0.1', () => { probe.close(() => { resolve(true) }) })
+  })
+  if (!portFree) {
+    throw new Error(`127.0.0.1:${LOCAL_PORT} is in use: stop the other \`npm run connect\` (or its wstunnel) first`)
+  }
+
   const sbx = await controlBox()
   const token = sbx.trafficAccessToken
   if (!token) throw new Error('control box is public; it must be private')
@@ -80,24 +95,43 @@ async function main() {
     )
     log('control box: PKI generated')
   }
-  if (!(await exists(`${STATE}/gateway.toml`))) {
-    // [gateway_jwt] lets the gateway mint launch credentials (without it
-    // CreateSandbox arrives with no launch_authentication).
-    // ttl_secs = 3600: sandbox tokens expire and get renewed, never "forever".
-    await sbx.files.write(`${STATE}/gateway.toml`, [
-      '[openshell]',
-      'version = 2',
-      '',
-      '[openshell.gateway.gateway_jwt]',
-      `signing_key_path = "${STATE}/pki/jwt/signing.pem"`,
-      `public_key_path  = "${STATE}/pki/jwt/public.pem"`,
-      `kid_path         = "${STATE}/pki/jwt/kid"`,
-      'gateway_id       = "openshell-e2b"',
-      'ttl_secs         = 3600',
-      '',
-    ].join('\n'))
-    log('control box: gateway config written')
-  }
+  // Gateway config, schema version 2. Rewritten on every connect so a control
+  // VM always runs the config this checkout expects.
+  //   [openshell.gateway.tls]   laptop CLI and supervisors reach the gateway over TLS.
+  //                             client_ca_path makes client certificates optional
+  //                             but verified: the CLI presents one, supervisors
+  //                             authenticate with their launch JWT instead.
+  //   [openshell.gateway.mtls_auth]    a valid CLI certificate = a gateway user.
+  //   [openshell.gateway.gateway_jwt]  mints launch credentials; without it
+  //                             CreateSandbox arrives with no launch_authentication.
+  //   [openshell.drivers.e2b]   our external compute driver's socket.
+  await sbx.files.write(`${STATE}/gateway.toml`, [
+    '[openshell]',
+    'version = 2',
+    '',
+    '[openshell.gateway]',
+    `bind_address   = "127.0.0.1:${GATEWAY_PORT}"`,
+    'compute_driver = "e2b"',
+    '',
+    '[openshell.gateway.tls]',
+    `cert_path      = "${STATE}/pki/server/tls.crt"`,
+    `key_path       = "${STATE}/pki/server/tls.key"`,
+    `client_ca_path = "${STATE}/pki/ca.crt"`,
+    '',
+    '[openshell.gateway.mtls_auth]',
+    'enabled = true',
+    '',
+    '[openshell.gateway.gateway_jwt]',
+    `signing_key_path = "${STATE}/pki/jwt/signing.pem"`,
+    `public_key_path  = "${STATE}/pki/jwt/public.pem"`,
+    `kid_path         = "${STATE}/pki/jwt/kid"`,
+    'gateway_id       = "openshell-e2b"',
+    'ttl_secs         = 3600',
+    '',
+    '[openshell.drivers.e2b]',
+    `socket_path = "${STATE}/run/e2b.sock"`,
+    '',
+  ].join('\n'))
   if (!(await exists(`${STATE}/driver.env`))) {
     const lines = (await readFile('.env', 'utf8')).split('\n')
     const key = lines.find((l) => l.startsWith('E2B_API_KEY='))
@@ -112,14 +146,24 @@ async function main() {
   // Long-running programs: each is its own E2B background command, tracked by
   // a PID file (matching by name is fragile: a script mentioning "wstunnel
   // server" matches `pkill -f "wstunnel server"` too).
-  const daemon = async (name: string, cmd: string, restart = false) => {
+  // `ready` is a shell test that passes once the new process serves.
+  const daemon = async (name: string, cmd: string, restart = false, ready?: string) => {
     const alive = await sbx.commands.run(
       `test -f ${STATE}/run/${name}.pid && kill -0 $(cat ${STATE}/run/${name}.pid) 2>/dev/null && echo yes || echo no`,
     )
     if (alive.stdout.trim() === 'yes') {
-      if (!restart) return log(`${name}: already running`)
-      await sbx.commands.run(`kill $(cat ${STATE}/run/${name}.pid) || true`)
-      await sleep(500)
+      if (!restart) {
+        if (ready) await probe(name, ready)
+        return log(`${name}: already running`)
+      }
+      // Wait until the old process is gone: the driver takes up to 15 s to
+      // clean up and removes its socket file on exit, which would otherwise
+      // delete the socket its replacement just created.
+      await sbx.commands.run(
+        `pid=$(cat ${STATE}/run/${name}.pid); kill $pid 2>/dev/null; ` +
+        'for i in $(seq 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.2; done; exit 1',
+        { timeoutMs: 30_000 },
+      ).catch(() => { throw new Error(`${name}: old process did not exit within 20 s`) })
     }
     // timeoutMs: 0 matters. The SDK's default is 60 s even for background
     // commands, so without it E2B kills the gateway after one minute.
@@ -128,8 +172,24 @@ async function main() {
       { background: true, timeoutMs: 0 },
     )
     await handle.disconnect()
-    await sleep(1000)
+    if (ready) {
+      await probe(name, ready)
+    } else {
+      await sleep(1000)
+    }
     log(`${name}: started`)
+  }
+  // Up means: the readiness test passes, the process is alive, and it is
+  // still alive two seconds later (the driver binds its socket before its
+  // startup sweep, which can still fail). The end-to-end check is the
+  // authenticated CLI status call below.
+  async function probe(name: string, ready: string) {
+    const alive = `kill -0 $(cat ${STATE}/run/${name}.pid) 2>/dev/null`
+    await sbx.commands.run(
+      `for i in $(seq 100); do ${alive} || break; ${ready} && sleep 2 && ${alive} && exit 0; sleep 0.2; done; ` +
+      `tail -5 ${STATE}/${name}.log >&2; exit 1`,
+      { timeoutMs: 40_000 },
+    ).catch(() => { throw new Error(`${name}: not up; see ${STATE}/${name}.log in the control VM`) })
   }
   // Persist the transport path: reconnecting a laptop must not invalidate
   // the gateway channel of existing task supervisors.
@@ -148,17 +208,14 @@ async function main() {
     `--restrict-http-upgrade-path-prefix ${pathSecret}`, restart)
   await daemon('driver',
     `sh -c 'set -a; . ${STATE}/driver.env; set +a; exec ${ROOT}/bin/openshell-driver-e2b ` +
-    `--bind-socket ${STATE}/run/e2b.sock --template openshell-workload-separated ` +
-    `--supervisor-template openshell-supervisor-separated --owner ${sbx.sandboxId} ` +
-    `--helper ${ROOT}/helper/e2b-helper.mjs --node ${ROOT}/node/bin/node ` +
+    `--bind-socket ${STATE}/run/e2b.sock --template ${TEMPLATES.workload} ` +
+    `--supervisor-template ${TEMPLATES.supervisor} --owner ${sbx.sandboxId} ` +
+    `--helper ${ROOT}/helper/e2b-helper.ts --node ${ROOT}/node/bin/node ` +
     `--gateway-tunnel ${STATE}/gateway-tunnel.json --state-dir ${STATE}/sandboxes ` +
-    `--gateway-ca ${STATE}/pki/ca.crt --gateway-cert ${STATE}/pki/client/tls.crt --gateway-key ${STATE}/pki/client/tls.key'`,
-    restart)
-  await daemon('gateway',
-    `${ROOT}/bin/openshell-gateway --config ${STATE}/gateway.toml ` +
-    `--tls-cert ${STATE}/pki/server/tls.crt --tls-key ${STATE}/pki/server/tls.key --tls-client-ca ${STATE}/pki/ca.crt ` +
-    `--enable-mtls-auth true --compute-driver e2b --compute-driver-socket ${STATE}/run/e2b.sock`,
-    restart)
+    `--gateway-ca ${STATE}/pki/ca.crt'`,
+    restart, `test -S ${STATE}/run/e2b.sock`)
+  await daemon('gateway', `${ROOT}/bin/openshell-gateway --config ${STATE}/gateway.toml`, restart,
+    `(exec 3<>/dev/tcp/127.0.0.1/${GATEWAY_PORT}) 2>/dev/null`)
 
   // `gateway add --local` requires the client certificates to exist already.
   const mtls = `${CONFIG}/openshell/gateways/${GATEWAY_NAME}/mtls`
@@ -197,13 +254,37 @@ async function main() {
     const line = String(d).trim()
     if (/error|failed|denied|refused|in use/i.test(line)) log('tunnel client:', line.slice(0, 300))
   })
-  log(`ready: laptop 127.0.0.1:${LOCAL_PORT} → gateway in ${sbx.sandboxId}`)
-  log(`try:   XDG_CONFIG_HOME=${CONFIG} .bin/openshell status`)
-
+  // From here on, never leave the tunnel holding the port behind.
   const stop = () => { client.kill(); process.exit(0) }
   process.on('SIGINT', stop)
   process.on('SIGTERM', stop)
-  client.on('exit', (code) => { log('tunnel client exited', code); process.exit(1) })
+  client.on('exit', (code) => {
+    log('tunnel client exited', code)
+    process.exit(1)
+  })
+  // End to end: an authenticated gateway call from the laptop CLI through
+  // the tunnel. Fails loudly instead of reporting a gateway that is not usable.
+  let status = ''
+  for (let i = 0; i < 30; i++) {
+    try {
+      // This gateway, through this tunnel: explicit flags, and no inherited
+      // OPENSHELL_GATEWAY* variables pointing somewhere else.
+      const { OPENSHELL_GATEWAY: _g, OPENSHELL_GATEWAY_ENDPOINT: _e, ...env } = process.env
+      status = execFileSync('.bin/openshell', [
+        '--gateway', GATEWAY_NAME, '--gateway-endpoint', `https://127.0.0.1:${LOCAL_PORT}`, 'status',
+      ], { env: { ...env, XDG_CONFIG_HOME: CONFIG }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })
+      if (/Status: Connected/.test(status) && /Authentication: Authenticated/.test(status)) break
+    } catch (e) {
+      status = String((e as { stdout?: string }).stdout ?? e)
+    }
+    await sleep(1000)
+  }
+  if (!/Status: Connected/.test(status) || !/Authentication: Authenticated/.test(status)) {
+    client.kill()
+    throw new Error(`gateway not usable through the tunnel:\n${status}`)
+  }
+  log(`ready: laptop 127.0.0.1:${LOCAL_PORT} → gateway in ${sbx.sandboxId}`)
+  log(`try:   XDG_CONFIG_HOME=${CONFIG} .bin/openshell status`)
 }
 
 main().catch((e) => { console.error(e.message ?? e); process.exit(1) })

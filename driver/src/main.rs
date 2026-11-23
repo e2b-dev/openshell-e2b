@@ -10,8 +10,9 @@
 //!   openshell-gateway  ──(gRPC over a Unix socket)──►  openshell-driver-e2b  ──►  E2B API
 //!        NVIDIA                                              ours
 //!
-//! The gateway is started with:
-//!   --compute-driver e2b --compute-driver-socket <path to our socket>
+//! The gateway selects it in `gateway.toml` (schema version 2):
+//!   `[openshell.gateway]`      `compute_driver = "e2b"`
+//!   `[openshell.drivers.e2b]`  `socket_path = "<path to our socket>"`
 //! and connects to the socket this program creates.
 //!
 //! WHY A UNIX SOCKET
@@ -67,7 +68,8 @@ struct Args {
     #[arg(long)]
     gateway_tunnel: PathBuf,
 
-    /// How supervisors reach the gateway, and the client certificate they use.
+    /// How supervisors reach the gateway, and the CA that signed its
+    /// certificate. Supervisors authenticate with their launch JWT.
     #[arg(
         long,
         env = "OPENSHELL_E2B_GATEWAY",
@@ -76,10 +78,6 @@ struct Args {
     gateway_endpoint: String,
     #[arg(long, env = "OPENSHELL_E2B_GATEWAY_CA")]
     gateway_ca: PathBuf,
-    #[arg(long, env = "OPENSHELL_E2B_GATEWAY_CERT")]
-    gateway_cert: PathBuf,
-    #[arg(long, env = "OPENSHELL_E2B_GATEWAY_KEY")]
-    gateway_key: PathBuf,
 
     /// Private control-plane state directory.
     #[arg(
@@ -102,12 +100,8 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::new(&args.log_level))
         .init();
 
-    // Create the private socket file. `SocketCleanup` deletes it again when
-    // the program exits, so a restart doesn't fail on "address in use".
     // Refuse to start on a state directory another user could tamper with.
     lifecycle::private_dir(&args.state_dir).map_err(|e| miette::miette!(e))?;
-    let listener = bind_private(&args.bind_socket).map_err(|e| miette::miette!(e))?;
-    let cleanup = SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), template = %args.template, owner = %args.owner, "starting E2B compute driver");
 
     // Serve NVIDIA's ComputeDriver gRPC interface (defined in their
@@ -124,8 +118,6 @@ async fn main() -> Result<()> {
         gateway_tunnel: args.gateway_tunnel,
         gateway_endpoint: args.gateway_endpoint,
         gateway_ca: args.gateway_ca,
-        gateway_cert: args.gateway_cert,
-        gateway_key: args.gateway_key,
         owner: args.owner,
     };
 
@@ -139,6 +131,12 @@ async fn main() -> Result<()> {
     {
         config.e2b.kill(&id).await.map_err(|e| miette::miette!(e))?;
     }
+    // Create the private socket file only now, after the startup sweep, so
+    // its existence means this driver is ready to serve. `SocketCleanup`
+    // deletes it again when the program exits, so a restart doesn't fail on
+    // "address in use".
+    let listener = bind_private(&args.bind_socket).map_err(|e| miette::miette!(e))?;
+    let cleanup = SocketCleanup::new(args.bind_socket.clone());
     let driver = service::E2bDriver::new(config);
     let shared = driver.shared();
     let server = tonic::transport::Server::builder()

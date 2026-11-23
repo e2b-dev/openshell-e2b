@@ -1,6 +1,6 @@
-//! Thin client for E2B: runs `node e2b-helper.mjs <op>` with a JSON request.
+//! Thin client for E2B: runs `node e2b-helper.ts <op>` with a JSON request.
 //!
-//!   Rust (this file) ──JSON on stdin──► e2b-helper.mjs ──E2B SDK──► E2B
+//!   Rust (this file) ──JSON on stdin──► e2b-helper.ts ──E2B SDK──► E2B
 //!                    ◄─JSON on stdout──
 //!
 //! The helper uses E2B's official JS SDK, so this file only has to shuttle JSON.
@@ -26,6 +26,8 @@ pub struct Created {
     pub traffic_access_token: String,
     /// Public hostname for port 9000, e.g. `9000-<id>.e2b.app`.
     pub host9000: String,
+    /// The `allowInternetAccess` value E2B received for this VM.
+    pub allow_internet_access: bool,
 }
 
 #[derive(Debug, Deserialize)]

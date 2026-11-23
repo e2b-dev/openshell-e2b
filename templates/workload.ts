@@ -1,33 +1,36 @@
-// openshell-workload: the E2B template every agent sandbox boots from.
+// Per-task worker VM (B): the agent runs here, under the OpenShell runtime.
 //
-// Baked in, so creating a sandbox needs no uploads of large files:
-//   /opt/openshell/openshell-sandbox   patched OpenShell runtime (Landlock v2 demo patch)
-//   /opt/openshell/wstunnel            tunnel server (supervisor → this box)
+// Baked in, so creating a sandbox uploads no large files:
+//   /opt/openshell/openshell-sandbox   OpenShell runtime
+//   /opt/openshell/wstunnel            reverse-tunnel server (supervisor → this VM)
 //   /opt/openshell/launch-sandbox.sh   builds the network fence and starts the runtime
 //   user "sandbox" uid/gid 1500        the identity the agent runs as
-//   /.openshell/channel/sandbox        where the driver writes this session's papers
+//   user "tunnel"  uid/gid 1501        runs the tunnel server, apart from the agent
+//   /.openshell/channel/sandbox        where the driver writes this session's files
+//   /.openshell/channel/control        the tunnel server's socket, reachable by gid 1500
 //
-// Build after scripts/build-binaries.ts:  npx tsx templates/workload.ts
+// Build after `npm run build:binaries`:  npm run template:workload
 import { Template, defaultBuildLogger } from 'e2b'
-
-const TAG = process.env.OPENSHELL_TAG ?? 'v0.1.2'
-const WSTUNNEL = 'https://github.com/erebe/wstunnel/releases/download/v11.0.0/wstunnel_11.0.0_linux_amd64.tar.gz'
+import { DIST, TEMPLATES, WSTUNNEL_LINUX } from '../scripts/openshell.ts'
 
 // Paths in .copy() are relative to the project root (where you run the build).
 export const template = Template({ fileContextPath: process.cwd() })
   .fromBaseImage()
-  .aptInstall(['socat', 'iproute2', 'util-linux', 'curl', 'ca-certificates'])
-  .copy(`dist/${TAG}/openshell-sandbox`, '/opt/openshell/openshell-sandbox', { mode: 0o755, user: 'root' })
+  .aptInstall(['iproute2', 'util-linux', 'curl', 'wget', 'ca-certificates'])
+  .copy(`${DIST}/openshell-sandbox`, '/opt/openshell/openshell-sandbox', { mode: 0o755, user: 'root' })
   .copy('templates/launch-sandbox.sh', '/opt/openshell/launch-sandbox.sh', { mode: 0o755, user: 'root' })
   .runCmd([
-    `curl -fsSL ${WSTUNNEL} | tar xz -C /opt/openshell wstunnel && chmod 755 /opt/openshell/wstunnel`,
+    `curl -fsSL ${WSTUNNEL_LINUX} | tar xz -C /opt/openshell wstunnel && chmod 755 /opt/openshell/wstunnel`,
     'groupadd -g 1500 sandbox && useradd -u 1500 -g 1500 -M -d /sandbox -s /bin/bash sandbox',
+    'groupadd -g 1501 tunnel && useradd -u 1501 -g 1501 -M -d /nonexistent -s /usr/sbin/nologin tunnel',
     // Driver-owned directories: the capability-free runtime cannot create these itself.
     'install -d -m 0755 -o root -g root /.openshell /.openshell/channel',
     'install -d -m 0700 -o 1500 -g 1500 /.openshell/channel/sandbox /sandbox',
+    // setgid: the socket the tunnel user creates here gets group 1500.
+    'install -d -m 2710 -o 1501 -g 1500 /.openshell/channel/control',
   ], { user: 'root' })
 
-Template.build(template, 'openshell-workload-separated', {
+await Template.build(template, TEMPLATES.workload, {
   cpuCount: 2,
   memoryMB: 2048,
   onBuildLogs: defaultBuildLogger(),
