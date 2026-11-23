@@ -107,6 +107,10 @@ impl Allocations {
 /// Leaked-set key for "VMs of this sandbox may exist that we have no id for".
 const SWEEP_PREFIX: &str = "sweep:";
 
+/// How long after a failed E2B create the driver keeps sweeping for VMs that
+/// E2B may still finish creating (a timed-out or lost reply).
+pub const SWEEP_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
+
 pub fn sweep_key(sandbox_id: &str) -> String {
     format!("{SWEEP_PREFIX}{sandbox_id}")
 }
@@ -332,8 +336,9 @@ async fn allocate_pair(
 }
 
 /// An E2B create call failed. E2B may still have allocated the VM (a lost or
-/// malformed reply), so besides the known ids, remove anything tagged with
-/// this sandbox. If that lookup fails, the sweep stays pending.
+/// malformed reply), or may still be creating it (a timed-out reply). Remove
+/// the known ids and anything already tagged with this sandbox now, and keep
+/// the sweep pending: the health loop repeats it until `SWEEP_GRACE` passes.
 async fn after_failed_create(
     cfg: &Config,
     sandbox_id: &str,
@@ -345,9 +350,9 @@ async fn after_failed_create(
         Ok(removed) => error.removed += removed,
         Err(sweep_error) => {
             warn!(sandbox_id, %sweep_error, "sweep after a failed create failed; health monitor will retry");
-            error.sweep_pending = true;
         }
     }
+    error.sweep_pending = true;
     error
 }
 
@@ -829,7 +834,9 @@ with (root / 'calls.jsonl').open('a') as f:
     f.write(json.dumps({'op': sys.argv[1], **req}) + '\n')
 import os, time
 op = sys.argv[1]
-if req.get('sandboxId') == 'unreachable':
+if req.get('sandboxId', '').startswith('gone'):
+    print(json.dumps({'ok': True, 'killed': False}))
+elif req.get('sandboxId') == 'unreachable':
     print(json.dumps({'ok': False, 'error': 'injected API failure'}))
 elif req.get('sandboxId') == 'stalled':
     time.sleep(3)
@@ -1012,7 +1019,8 @@ else:
         .err()
         .ok_or("a failed create must fail")?;
         assert!(error.message.contains("reply lost"));
-        assert!(!error.sweep_pending);
+        // E2B may still create a VM later: the sweep stays pending.
+        assert!(error.sweep_pending);
         assert_eq!(error.removed, 1);
         let log = std::fs::read_to_string(dir.join("calls.jsonl"))?;
         assert!(log.contains(r#""openshell.ai/sandbox-id": "sbx""#));

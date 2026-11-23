@@ -59,6 +59,9 @@ pub struct Shared {
     /// retrying the kill. Until they are gone, delete stays retryable and a
     /// new create for that sandbox is refused.
     pub leaked: Arc<Mutex<HashMap<String, String>>>,
+    /// Sweep keys in `leaked` and the time before which they must stay, even
+    /// after a sweep finds nothing (E2B may still create a VM).
+    pub sweep_until: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     /// Set by shutdown under the `pending` lock: no new creates after that.
     pub stopping: Arc<AtomicBool>,
     /// Fan-out of changes to every open `WatchSandboxes` stream.
@@ -187,7 +190,14 @@ async fn run_create(
             };
             leaked.extend(error.leaked_boxes.into_iter().map(|vm| (vm, id.clone())));
             if error.sweep_pending {
-                leaked.insert(lifecycle::sweep_key(&id), id.clone());
+                let key = lifecycle::sweep_key(&id);
+                if let Ok(mut until) = shared.sweep_until.lock() {
+                    until.insert(
+                        key.clone(),
+                        std::time::Instant::now() + lifecycle::SWEEP_GRACE,
+                    );
+                }
+                leaked.insert(key, id.clone());
             }
             drop(leaked);
             (Err(error.message), cleanup)
@@ -219,10 +229,11 @@ async fn roll_back_panicked(
     let ids = allocations.snapshot();
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     let mut error = lifecycle::rollback(cfg, format!("create failed: {panic}"), &refs).await;
-    match lifecycle::sweep(cfg, sandbox_id).await {
-        Ok(removed) => error.removed += removed,
-        Err(_) => error.sweep_pending = true,
+    if let Ok(removed) = lifecycle::sweep(cfg, sandbox_id).await {
+        error.removed += removed;
     }
+    // An E2B create may have been in flight when the task panicked.
+    error.sweep_pending = true;
     error
 }
 
@@ -241,6 +252,7 @@ impl E2bDriver {
             sandboxes: Arc::default(),
             pending: Arc::default(),
             leaked: Arc::default(),
+            sweep_until: Arc::default(),
             stopping: Arc::default(),
             events: events.clone(),
         };
@@ -526,10 +538,15 @@ impl ComputeDriver for E2bDriver {
             drop(table);
             result
         });
-        task.await
+        let removed = task
+            .await
             .map_err(|e| Status::internal(format!("delete task failed: {e}")))?
             .map_err(|e| Status::unavailable(format!("delete not confirmed, retry: {e}")))?;
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        // The record is gone either way; `deleted` says whether this request
+        // removed a VM (both may already have expired).
+        Ok(Response::new(DeleteSandboxResponse {
+            deleted: removed > 0,
+        }))
     }
 
     type WatchSandboxesStream = WatchStream;
@@ -726,12 +743,71 @@ mod tests {
         .ok_or("the task must panic")?;
         let error = super::roll_back_panicked(&cfg, "sbx", &allocations, &panicked).await;
         assert!(error.message.contains("panic"));
-        assert!(error.leaked_boxes.is_empty() && !error.sweep_pending);
+        // An E2B create may have been in flight: the sweep stays pending.
+        assert!(error.leaked_boxes.is_empty() && error.sweep_pending);
         let log = std::fs::read_to_string(dir.join("calls.jsonl"))?;
         assert!(log.contains(r#""op": "kill", "sandboxId": "worker-vm""#));
         assert!(
             log.contains(r#""openshell.ai/sandbox-id": "sbx""#),
             "swept by tag too"
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_vm_that_appears_after_the_first_sweep_is_still_removed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = crate::lifecycle::tests::fake_config("late-vm")?;
+        let driver = E2bDriver::new(cfg);
+        let key = crate::lifecycle::sweep_key("sbx");
+        driver
+            .shared
+            .leaked
+            .lock()
+            .await
+            .insert(key.clone(), "sbx".into());
+        if let Ok(mut until) = driver.shared.sweep_until.lock() {
+            until.insert(
+                key.clone(),
+                std::time::Instant::now() + std::time::Duration::from_mins(1),
+            );
+        }
+        // E2B finishes the create only now.
+        std::fs::write(dir.join("listed.json"), r#"[{"sandboxId": "late-vm"}]"#)?;
+        crate::health::retry_leaked(&driver.shared).await;
+        let log = std::fs::read_to_string(dir.join("calls.jsonl"))?;
+        assert!(log.contains(r#""op": "kill", "sandboxId": "late-vm""#));
+        // Still in its grace period: the sweep entry stays, the id stays blocked.
+        assert!(driver.shared.leaked.lock().await.contains_key(&key));
+        // Grace over: the next successful sweep drops it.
+        if let Ok(mut until) = driver.shared.sweep_until.lock() {
+            until.insert(key.clone(), std::time::Instant::now());
+        }
+        crate::health::retry_leaked(&driver.shared).await;
+        assert!(!driver.shared.leaked.lock().await.contains_key(&key));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_pair_whose_vms_already_expired_reports_nothing_deleted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (cfg, dir) = crate::lifecycle::tests::fake_config("expired-pair")?;
+        let driver = Arc::new(E2bDriver::new(cfg));
+        driver.shared.sandboxes.lock().await.insert(
+            "sbx".into(),
+            crate::lifecycle::Running {
+                sandbox: openshell_core::proto::compute::v1::DriverSandbox::default(),
+                e2b_id: "gone-worker".into(),
+                supervisor_id: "gone-supervisor".into(),
+                deleting: false,
+            },
+        );
+        assert!(!delete(&driver).await??.into_inner().deleted);
+        assert!(
+            driver.shared.sandboxes.lock().await.is_empty(),
+            "the record still goes"
         );
         std::fs::remove_dir_all(dir)?;
         Ok(())

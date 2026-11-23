@@ -151,7 +151,10 @@ async fn main() -> Result<()> {
                 tracing::warn!("shutdown cleanup timed out; some E2B boxes may remain until their timeout");
             }
             drop(cleanup); // remove the socket file before exiting
-            std::process::exit(0);
+            // Return instead of process::exit: dropping the runtime drops the
+            // tasks still running, and with them (kill_on_drop) any E2B
+            // helper process that outlived the budget.
+            Ok(())
         }
     }
 }
