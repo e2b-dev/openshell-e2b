@@ -25,6 +25,7 @@
 import { randomBytes } from 'node:crypto'
 import { execFileSync, spawn } from 'node:child_process'
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Sandbox } from 'e2b'
 import { TEMPLATES } from './openshell.ts'
@@ -139,7 +140,10 @@ async function main() {
       `test -f ${STATE}/run/${name}.pid && kill -0 $(cat ${STATE}/run/${name}.pid) 2>/dev/null && echo yes || echo no`,
     )
     if (alive.stdout.trim() === 'yes') {
-      if (!restart) return log(`${name}: already running`)
+      if (!restart) {
+        if (ready) await probe(name, ready)
+        return log(`${name}: already running`)
+      }
       // Wait until the old process is gone: the driver takes up to 15 s to
       // clean up and removes its socket file on exit, which would otherwise
       // delete the socket its replacement just created.
@@ -157,14 +161,23 @@ async function main() {
     )
     await handle.disconnect()
     if (ready) {
-      await sbx.commands.run(
-        `for i in $(seq 100); do ${ready} && exit 0; sleep 0.2; done; tail -5 ${STATE}/${name}.log >&2; exit 1`,
-        { timeoutMs: 30_000 },
-      ).catch(() => { throw new Error(`${name}: did not come up; see ${STATE}/${name}.log`) })
+      await probe(name, ready)
     } else {
       await sleep(1000)
     }
     log(`${name}: started`)
+  }
+  // Up means: the readiness test passes, the process is alive, and it is
+  // still alive two seconds later (the driver binds its socket before its
+  // startup sweep, which can still fail). The end-to-end check is the
+  // authenticated CLI status call below.
+  async function probe(name: string, ready: string) {
+    const alive = `kill -0 $(cat ${STATE}/run/${name}.pid) 2>/dev/null`
+    await sbx.commands.run(
+      `for i in $(seq 100); do ${alive} || break; ${ready} && sleep 2 && ${alive} && exit 0; sleep 0.2; done; ` +
+      `tail -5 ${STATE}/${name}.log >&2; exit 1`,
+      { timeoutMs: 40_000 },
+    ).catch(() => { throw new Error(`${name}: not up; see ${STATE}/${name}.log in the control VM`) })
   }
   // Persist the transport path: reconnecting a laptop must not invalidate
   // the gateway channel of existing task supervisors.
@@ -209,6 +222,17 @@ async function main() {
     log(`CLI: registered gateway '${GATEWAY_NAME}'`)
   }
 
+  // The status check below must talk through this run's own tunnel, not a
+  // leftover one: refuse to start when the local port is already taken.
+  const portFree = await new Promise<boolean>((resolve) => {
+    const probe = createServer()
+    probe.once('error', () => { resolve(false) })
+    probe.listen(LOCAL_PORT, '127.0.0.1', () => { probe.close(() => { resolve(true) }) })
+  })
+  if (!portFree) {
+    throw new Error(`127.0.0.1:${LOCAL_PORT} is in use: stop the other \`npm run connect\` (or its wstunnel) first`)
+  }
+
   // Open the tunnel on the laptop. 10 s heartbeat: spike A showed E2B's
   // proxy drops connections that stay silent for about a minute.
   const client = spawn(`${process.cwd()}/.bin/wstunnel`, [
@@ -229,6 +253,24 @@ async function main() {
     const line = String(d).trim()
     if (/error|failed|denied|refused|in use/i.test(line)) log('tunnel client:', line.slice(0, 300))
   })
+  // End to end: an authenticated gateway call from the laptop CLI through
+  // the tunnel. Fails loudly instead of reporting a gateway that is not usable.
+  let status = ''
+  for (let i = 0; i < 30; i++) {
+    try {
+      status = execFileSync('.bin/openshell', ['status'], {
+        env: { ...process.env, XDG_CONFIG_HOME: CONFIG }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      if (/Status: Connected/.test(status) && /Authentication: Authenticated/.test(status)) break
+    } catch (e) {
+      status = String((e as { stdout?: string }).stdout ?? e)
+    }
+    await sleep(1000)
+  }
+  if (!/Status: Connected/.test(status) || !/Authentication: Authenticated/.test(status)) {
+    client.kill()
+    throw new Error(`gateway not usable through the tunnel:\n${status}`)
+  }
   log(`ready: laptop 127.0.0.1:${LOCAL_PORT} → gateway in ${sbx.sandboxId}`)
   log(`try:   XDG_CONFIG_HOME=${CONFIG} .bin/openshell status`)
 
