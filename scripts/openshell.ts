@@ -15,8 +15,8 @@ export const OPENSHELL_RELEASE = `https://github.com/NVIDIA/OpenShell/releases/d
 // stock release binaries instead (also false/no/off). Anything else is
 // rejected, so a typo cannot silently select the relaxed build.
 function parseSwitch(name: string, value: string | undefined, fallback: boolean): boolean {
-  const v = (value ?? '').trim().toLowerCase()
-  if (v === '') return fallback
+  if (value === undefined) return fallback
+  const v = value.trim().toLowerCase()
   if (['1', 'true', 'yes', 'on'].includes(v)) return true
   if (['0', 'false', 'no', 'off'].includes(v)) return false
   throw new Error(`${name}=${value} is not a switch value; use 1/true/yes/on or 0/false/no/off`)
