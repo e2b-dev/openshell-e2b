@@ -41,7 +41,9 @@ use std::path::PathBuf;
 
 /// Paths inside the worker VM (created by the workload template).
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
-pub const CONTROL_SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
+/// The worker's tunnel server (uid 1501) listens here; the runtime (uid 1500)
+/// dials it. Its own directory, separate from the runtime's private files.
+pub const CONTROL_SOCKET_PATH: &str = "/.openshell/channel/control/control.sock";
 pub const SERVER_CERT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 pub const SERVER_KEY_PATH: &str = "/.openshell/channel/sandbox/server.key";
 

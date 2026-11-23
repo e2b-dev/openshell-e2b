@@ -25,12 +25,15 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 const WORKLOAD_UID: u32 = 1500;
+/// The worker's tunnel server runs as its own user (workload template).
+const TUNNEL_UID: u32 = 1501;
 /// Port inside the worker VM that E2B's proxy exposes (tunnel server).
 const TUNNEL_PORT: u16 = 9000;
 /// Task state in the supervisor VM.
 const DIR: &str = "/run/openshell-task";
-/// wstunnel restriction file in the worker VM.
-const TUNNEL_RULES: &str = "/run/openshell-tunnel.yaml";
+/// Tunnel server state in the worker VM: rules and log. Root-owned; the
+/// tunnel user can only read the rules, the workload user cannot see either.
+const TUNNEL_DIR: &str = "/run/openshell-tunnel";
 
 /// Everything the driver needs to know about its surroundings.
 #[derive(Clone, Debug)]
@@ -338,17 +341,33 @@ async fn provision_and_start(
     // 7. The worker side of the control channel. The supervisor VM opens a
     //    reverse tunnel to this server; the server then listens on
     //    control.sock, which the runtime dials. Only that one reverse Unix
-    //    socket, only behind the random path. Runs as uid 1500 so the socket
-    //    it creates belongs to the runtime's user.
+    //    socket, only behind the random path.
+    //    The server runs as its own uid 1501, so the workload uid can neither
+    //    change its rules (wstunnel reloads them) nor signal it. The socket
+    //    directory is 1501:1500 mode 2710 (workload template): with umask
+    //    0007 the socket is group 1500, which lets the runtime connect.
     let path_secret = random_hex(16);
     let rules = tunnel_rules(&path_secret);
     cfg.e2b
-        .write(e2b_id, TUNNEL_RULES, rules.as_bytes(), "root", Some(0o600))
+        .run_ok(
+            e2b_id,
+            &format!("install -d -m 0750 -o root -g {TUNNEL_UID} {TUNNEL_DIR}"),
+            "root",
+        )
+        .await?;
+    cfg.e2b
+        .write(
+            e2b_id,
+            &format!("{TUNNEL_DIR}/rules.yaml"),
+            rules.as_bytes(),
+            "root",
+            Some(0o640),
+        )
         .await?;
     cfg.e2b
         .run_ok(
             e2b_id,
-            &format!("chown {WORKLOAD_UID}:{WORKLOAD_UID} {TUNNEL_RULES}"),
+            &format!("chown root:{TUNNEL_UID} {TUNNEL_DIR}/rules.yaml"),
             "root",
         )
         .await?;
@@ -356,9 +375,9 @@ async fn provision_and_start(
         .run_background(
             e2b_id,
             &format!(
-                "exec setpriv --reuid={WORKLOAD_UID} --regid={WORKLOAD_UID} --clear-groups --no-new-privs \
-                 /opt/openshell/wstunnel server ws://0.0.0.0:{TUNNEL_PORT} --restrict-config {TUNNEL_RULES} \
-                 > /tmp/wstunnel.log 2>&1"
+                "exec setpriv --reuid={TUNNEL_UID} --regid={TUNNEL_UID} --clear-groups --no-new-privs \
+                 sh -c 'umask 0007; exec /opt/openshell/wstunnel server ws://0.0.0.0:{TUNNEL_PORT} \
+                 --restrict-config {TUNNEL_DIR}/rules.yaml' > {TUNNEL_DIR}/wstunnel.log 2>&1"
             ),
             "root",
         )
@@ -369,7 +388,7 @@ async fn provision_and_start(
             e2b_id,
             &format!(
                 "for i in $(seq 50); do ss -ltn | grep -q ':{TUNNEL_PORT} ' && exit 0; sleep 0.2; done; \
-                 tail -5 /tmp/wstunnel.log >&2; exit 1"
+                 tail -5 {TUNNEL_DIR}/wstunnel.log >&2; exit 1"
             ),
             "root",
         )
@@ -655,7 +674,7 @@ else:
         let rules = super::tunnel_rules("abc123");
         assert!(rules.contains("!PathPrefix '^abc123$'"));
         assert!(rules.contains("protocol: [Unix]"));
-        assert!(rules.contains(r"unix_path: '^/\.openshell/channel/sandbox/control\.sock$'"));
+        assert!(rules.contains(r"unix_path: '^/\.openshell/channel/control/control\.sock$'"));
         assert!(!rules.contains("!Tunnel"));
     }
 

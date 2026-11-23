@@ -97,6 +97,15 @@ async function main() {
     // Supervisors authenticate with their own launch JWT; no shared client certificate.
     assert.equal((await run(supervisor, 'test -s /run/openshell-task/auth.json && ! ls /run/openshell-task | grep -q client')).exitCode, 0)
     pass('Supervisor holds its own launch JWT and no gateway client certificate')
+    // The worker's tunnel server runs as its own uid; the workload uid can't
+    // read or change its rules, but its group reaches the control socket.
+    const tunnelLayout = await run(worker, [
+      '[ "$(ps -o user= -C wstunnel | sort -u)" = "tunnel" ]',
+      '! setpriv --reuid=1500 --regid=1500 --clear-groups cat /run/openshell-tunnel/rules.yaml >/dev/null 2>&1',
+      '[ "$(stat -c %G /.openshell/channel/control/control.sock)" = "sandbox" ]',
+    ].join(' && '))
+    assert.equal(tunnelLayout.exitCode, 0, `worker tunnel layout: ${tunnelLayout.stdout}${tunnelLayout.stderr}`)
+    pass('Worker tunnel runs as its own uid; the workload uid cannot read its rules')
     console.log((await inside('printf "  Agent uid="; id -u; grep -E "^(CapEff|NoNewPrivs)" /proc/self/status')).trim())
 
     step('3. Two enforcement layers — OpenShell policy + E2B worker egress fence')
