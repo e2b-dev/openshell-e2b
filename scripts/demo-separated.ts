@@ -88,7 +88,16 @@ async function main() {
     pass('Gateway Ready with a distinct supervisor/worker pair')
     const supervisor = await Sandbox.connect(a.sandboxId)
     const worker = await Sandbox.connect(b.sandboxId)
-    assert.equal((await run(supervisor, 'test -f /run/openshell-task/ready && kill -0 $(cat /run/openshell-task/supervisor.pid)')).exitCode, 0)
+    // The gateway can report Ready (supervisor connected) a moment before the
+    // launcher writes its ready marker, so wait for it briefly.
+    let supervisorUp = false
+    for (let i = 0; i < 40 && !supervisorUp; i++) {
+      const state = await run(supervisor, 'cd /run/openshell-task; if [ -f failed ]; then cat failed; exit 2; fi; test -f ready && kill -0 $(cat supervisor.pid)')
+      if (state.exitCode === 2) throw new Error(`supervisor launcher failed: ${state.stdout}`)
+      supervisorUp = state.exitCode === 0
+      if (!supervisorUp) await sleep(500)
+    }
+    assert(supervisorUp, 'supervisor ready marker did not appear within 20 s')
     assert.equal((await run(worker, 'test ! -e /opt/openshell/openshell-supervisor && test ! -e /run/openshell-task/auth.json')).exitCode, 0)
     for (const sbx of [supervisor, worker]) {
       assert.equal((await run(sbx, 'test -z "$E2B_API_KEY" && test ! -f /home/user/openshell/driver.env')).exitCode, 0)
