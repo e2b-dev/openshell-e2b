@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { Sandbox } from 'e2b'
-import { DIST, LANDLOCK_ABI2, OPENSHELL_RELEASE, OPENSHELL_TAG, TEMPLATES } from './openshell.ts'
+import { DIST, LANDLOCK_ABI2, OPENSHELL_TAG, TEMPLATES, verifiedRelease } from './openshell.ts'
 
 const NVIDIA_BINS = ['openshell-sandbox', 'openshell-supervisor'] as const
 // Release asset names for the stock path.
@@ -70,7 +70,7 @@ async function main() {
     } else if (!driverOnly) {
       await sbx.commands.run(
         'mkdir -p /tmp/os/target/release && cd /tmp/os/target/release && ' +
-        NVIDIA_BINS.map((b) => `curl -fsSL ${OPENSHELL_RELEASE}/${RELEASE_ASSET[b]} | tar xz ${b}`).join(' && '),
+        NVIDIA_BINS.map((b) => verifiedRelease(RELEASE_ASSET[b], `${b}-checksums-sha256.txt`, '/tmp/os/target/release', b)).join(' && '),
         { timeoutMs: 180_000, ...stream },
       )
     }
