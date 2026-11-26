@@ -1,0 +1,12 @@
+{
+  "agents": { "defaults": { "model": { "primary": "anthropic/claude-haiku-4-5" } } },
+  "tools": {
+    "web": {
+      "fetch": {
+        "ssrfPolicy": {
+          "allowRfc2544BenchmarkRange": true
+        }
+      }
+    }
+  }
+}

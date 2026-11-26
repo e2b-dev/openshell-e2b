@@ -45,5 +45,7 @@ export const TEMPLATES = {
   builder: 'openshell-builder',
   control: 'openshell-control-separated',
   supervisor: 'openshell-supervisor-separated',
-  workload: 'openshell-workload-separated',
+  // OPENSHELL_WORKLOAD_TEMPLATE selects another worker template, e.g. one
+  // built on E2B's claude template (spike: OPENSHELL_WORKLOAD_FROM=claude).
+  workload: process.env.OPENSHELL_WORKLOAD_TEMPLATE ?? 'openshell-workload-separated',
 } as const
