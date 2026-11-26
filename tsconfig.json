@@ -10,5 +10,5 @@
     "erasableSyntaxOnly": true,
     "types": ["node"]
   },
-  "include": ["scripts/**/*.ts", "templates/**/*.ts", "driver/*.ts"]
+  "include": ["scripts/**/*.ts", "templates/**/*.ts", "media/**/*.ts", "driver/*.ts"]
 }

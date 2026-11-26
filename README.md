@@ -118,6 +118,40 @@ The left pane runs `studio create`, `studio fence`, `studio policy`, `studio req
 
 The recorder requires VHS, tmux, gum, FFmpeg and the Menlo font. It connects the gateway automatically, records the real commands, and accelerates the capture into a 45-second 1080p MP4. Export requires 14 live assertions plus GET-allow and POST-deny records from the supervisor feed. The full-speed capture, assertion report and source audit events are saved under `dist/studio/`. Detach with Ctrl-B, D to close the interactive studio; the launcher cleans up its task pair and any laptop tunnel it started. The shared control VM remains available. No other task pairs are removed.
 
+## Personal agent: OpenClaw under OpenShell
+
+[OpenClaw](https://openclaw.ai) runs as the agent in worker B. It never holds the Anthropic key, and it reaches only the hosts you allow.
+
+```bash
+npm run template:workload:openclaw   # once: worker template with OpenClaw preinstalled
+OPENSHELL_WORKLOAD_TEMPLATE=openshell-workload-openclaw npm run connect   # terminal 1
+npm run openclaw -- run              # terminal 2: scripted demo with checks, then cleanup
+npm run demo:record:openclaw         # live run → media/openclaw-demo.mp4 (+ 720p copy)
+```
+
+The scripted demo has three acts:
+
+1. **No access.** The user asks for the top Hacker News story. The policy has no rule for that host, so OpenShell denies OpenClaw's request.
+2. **Live grant.** `allow news.ycombinator.com` adds a read-only (GET) rule for OpenClaw's Node binary with `policy set`. The sandbox keeps running. The same question now gets an answer.
+3. **Blocked upload.** The user asks the agent to post a note to a team webhook with curl. Nobody allowed that host, so OpenShell denies it. The agent often reports a network error. The audit log shows what actually happened.
+
+Every step is also a separate command: `setup`, `web`, `ask "<message>"`, `ask webhook`, `allow <host>`, `audit`, `check`, `cleanup`.
+
+**Web chat.** `npm run openclaw -- web` starts OpenClaw's own web UI (the Control UI of `openclaw gateway`) on loopback port 18789 inside the agent VM. `openshell forward service` carries it to `http://127.0.0.1:18789` on the laptop over the gateway channel, so the VM has no public port. The URL with its one-time token is in `dist/openclaw-demo/web.json`. The video uses this UI for the agent and the terminal for the operator.
+
+**Video.** `media/openclaw/record.ts` records the terminal scenes with VHS and the web-chat scenes as Chrome screencast frames, with wall-clock marks around every wait. `media/openclaw/compose.ts` speeds up the waits (with a badge), adds a caption per scene, crossfades and adds an end card. The recorder refuses to export unless the audit log shows all three outcomes. It needs VHS, FFmpeg and Google Chrome.
+
+How the key stays out of the VM: `.env` provides `ANTHROPIC_API_KEY` to an OpenShell provider on the gateway (profile `providers/openclaw-anthropic.yaml`). Inside the sandbox, the variable holds an `openshell:resolve:…` placeholder. Supervisor A substitutes the real key only on requests to `api.anthropic.com` from OpenClaw's Node binary.
+
+Template notes (`templates/workload-openclaw.ts`):
+
+- OpenClaw is installed in `/usr/lib/openclaw`. The default Landlock policy blocks `/opt`. In the E2B base image, `/usr/local` is world-writable, and OpenClaw refuses to load plugins from world-writable paths.
+- `/etc/openclaw/openclaw.json` allows web fetch to OpenShell's synthetic DNS range (198.18.0.0/15). Without this, OpenClaw's SSRF guard blocks every allowed host.
+- The `openclaw` wrapper sets `SQLITE_TMPDIR=/tmp`, because Landlock blocks `/var/tmp`.
+- OpenShell matches a binary rule against the process and its ancestors. A `curl` started by OpenClaw's exec tool therefore gets OpenClaw's grants. The read-only (GET only) rule is what stops it from writing.
+
+The driver reads `OPENSHELL_WORKLOAD_TEMPLATE` when it starts. If a gateway is already connected with the default template, stop it before you run the OpenClaw demo.
+
 ## Build and test
 
 ```bash
