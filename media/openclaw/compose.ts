@@ -208,6 +208,6 @@ for (let i = 1; i < clips.length; i++) {
   prev = out
 }
 ff(...inputs, '-filter_complex', filters.join(';'), '-map', '[v]', '-r', String(FPS), '-c:v', 'libx264', '-preset', 'slow', '-crf', '18',
-  '-pix_fmt', 'yuv420p', '-movflags', '+faststart', 'media/openclaw-demo.mp4')
-ff('-i', 'media/openclaw-demo.mp4', '-vf', 'scale=1280:-2', '-c:v', 'libx264', '-preset', 'slow', '-crf', '21', '-movflags', '+faststart', 'media/openclaw-demo-720p.mp4')
+  '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-movflags', '+faststart', 'media/openclaw-demo.mp4')
+ff('-i', 'media/openclaw-demo.mp4', '-vf', 'scale=1280:-2', '-c:v', 'libx264', '-preset', 'slow', '-crf', '21', '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-movflags', '+faststart', 'media/openclaw-demo-720p.mp4')
 console.log(`media/openclaw-demo.mp4: ${duration('media/openclaw-demo.mp4').toFixed(1)}s (+ 720p copy)`)
