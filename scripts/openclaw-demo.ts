@@ -158,24 +158,28 @@ async function ask(message: string) {
 }
 
 async function allow(host: string) {
+  if (!/^[a-z0-9.-]+$/i.test(host)) {
+    throw new Error(`not a host name: ${host}`)
+  }
+  // --base is the sandbox's own policy, earlier grants included, without the provider's entries.
   const base = os(['policy', 'get', SANDBOX, '--base'])
   const yaml = base.slice(base.indexOf('\n---\n') + 5)
-  const current = os(['policy', 'get', SANDBOX])
-  // Keep earlier grants: add this host to the demo's own rule list.
-  const hosts = [...new Set([...(/# demo-hosts: (.*)/.exec(current)?.[1]?.split(',').filter(Boolean) ?? []), host])]
-  const rules = hosts.map((h) => `  ${h.replace(/[^a-z0-9]/gi, '_')}:
-    name: ${h} read-only
+  const rule = `  ${host.replace(/[^a-z0-9]/gi, '_')}:
+    name: ${host} read-only
     endpoints:
-      - host: ${h}
+      - host: ${host}
         port: 443
         protocol: rest
         enforcement: enforce
         access: read-only
     binaries:
-      - path: ${NODE}`).join('\n')
+      - path: ${NODE}`
+  const policy = /^network_policies:\s*$/m.test(yaml)
+    ? yaml.replace(/^network_policies:\s*$/m, `network_policies:\n${rule}`)
+    : `${yaml.trimEnd()}\nnetwork_policies:\n${rule}\n`
   const file = 'dist/openclaw-demo/policy.yaml'
   mkdirSync('dist/openclaw-demo', { recursive: true })
-  writeFileSync(file, `${yaml.trimEnd()}\n# demo-hosts: ${hosts.join(',')}\nnetwork_policies:\n${rules}\n`)
+  writeFileSync(file, policy)
   await working('updating the policy, live', ['policy', 'set', SANDBOX, '--policy', file, '--wait'])
   console.log(`${c.green}●${c.reset} ${c.bold}POLICY UPDATED${c.reset}  ${host}  ${c.dim}read-only (GET), OpenClaw only, no restart${c.reset}`)
 }
