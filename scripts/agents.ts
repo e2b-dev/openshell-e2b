@@ -16,10 +16,10 @@
 //   OPENSHELL_WORKLOAD_TEMPLATE=openshell-workload-agents npm run connect
 // and E2B_API_KEY, ANTHROPIC_API_KEY and OPENAI_API_KEY (for the Codex worker) in .env.
 import { randomBytes } from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Sandbox } from 'e2b'
+import { CommandExitError, Sandbox } from 'e2b'
 
 type Agent = 'claude' | 'codex'
 type Worker = { n: number; agent: Agent; issue: string; source: string; test: string }
@@ -29,10 +29,11 @@ const WORKERS: Worker[] = [
   { n: 2, agent: 'claude', issue: '2-duration', source: 'src/duration.js', test: 'test/duration.test.js' },
   { n: 3, agent: 'codex', issue: '3-csv', source: 'src/csv.js', test: 'test/csv.test.js' },
 ]
-const PROFILES: Record<Agent, { file: string; type: string; key: string; host: string }> = {
-  claude: { file: 'providers/fleet-claude-code.yaml', type: 'fleet-claude-code', key: 'ANTHROPIC_API_KEY', host: 'api.anthropic.com' },
-  codex: { file: 'providers/fleet-codex.yaml', type: 'fleet-codex', key: 'OPENAI_API_KEY', host: 'api.openai.com' },
+const PROFILES: Record<Agent, { file: string; type: string; key: string; host: string; route: string }> = {
+  claude: { file: 'providers/fleet-claude-code.yaml', type: 'fleet-claude-code', key: 'ANTHROPIC_API_KEY', host: 'api.anthropic.com', route: 'POST /v1/messages' },
+  codex: { file: 'providers/fleet-codex.yaml', type: 'fleet-codex', key: 'OPENAI_API_KEY', host: 'api.openai.com', route: 'POST /v1/responses' },
 }
+const MAX_SOURCE_BYTES = 256 * 1024
 const FIXTURE = 'fixtures/fleet-repo'
 const REPO = '/sandbox/fleet-repo' // `sandbox upload` puts a folder inside DEST under its own name
 const OUT = 'dist/agents'
@@ -44,6 +45,13 @@ if (!/^[\w.-]+$/.test(CLAUDE_MODEL)) {
 const id = randomBytes(3).toString('hex') // names: agents-<id>-<n> (17 chars, limit 19)
 const keep = process.argv.includes('--keep')
 
+// The fixture's test/ tree, in the same shape the worker reports it, to detect any test change.
+function manifest(): string {
+  const r = spawnSync('sh', ['-c', `cd ${FIXTURE} && find test -print0 | sort -z | xargs -0 stat -f '%HT %N' | sed 's/^Regular File/regular file/; s/^Directory/directory/' | head -c 65536; find test -type f -print0 | sort -z | xargs -0 shasum -a 256 | head -c 65536`], { encoding: 'utf8' })
+  return r.stdout
+}
+const testManifest = manifest()
+
 const c = { dim: '\x1b[2m', bold: '\x1b[1m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', blue: '\x1b[34m', magenta: '\x1b[35m', reset: '\x1b[0m' }
 const env = { ...process.env, XDG_CONFIG_HOME: join(process.cwd(), '.openshell-separated'), OPENSHELL_COLOR: 'never' }
 
@@ -53,12 +61,15 @@ const owned = { sandboxes: new Set<string>(), providers: new Set<string>(), grad
 function os(args: string[], extraEnv: Record<string, string> = {}, timeoutMs = 120_000): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn('.bin/openshell', args, { env: { ...env, ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs })
-    let out = ''
-    let err = ''
-    child.stdout.on('data', (d) => { out += d })
-    child.stderr.on('data', (d) => { err += d })
+    const outChunks: Buffer[] = []
+    const errChunks: Buffer[] = []
+    child.stdout.on('data', (d: Buffer) => { outChunks.push(d) })
+    child.stderr.on('data', (d: Buffer) => { errChunks.push(d) })
     child.on('error', reject)
     child.on('close', (code, signal) => {
+      // Decode once, so a multibyte character split across chunks stays intact.
+      const out = Buffer.concat(outChunks).toString('utf8')
+      const err = Buffer.concat(errChunks).toString('utf8')
       if (code === 0) {
         resolve(out)
       } else {
@@ -102,6 +113,7 @@ type Result = Worker & {
   testsEdited: boolean // informational: the grader always uses the original tests
   diff: string
   modelRequests: number
+  otherModelRoutes: string[] // allowed by the provider, on the model host, outside the inference route
   unexpectedAllowed: string[]
   denied: string[]
   auditLines: number
@@ -109,8 +121,17 @@ type Result = Worker & {
 }
 
 async function createSandbox(sandbox: string, provider: string) {
+  try {
+    await os(['sandbox', 'create', '--name', sandbox, '--provider', provider, '--detach', '--no-tty', '--', 'sleep', 'infinity'], {}, 300_000)
+  } catch (error) {
+    // A name conflict means the sandbox is someone else's; any other failure may have
+    // left ours half-created, so it stays on the cleanup list.
+    if (!/already exists/i.test((error as Error).message)) {
+      owned.sandboxes.add(sandbox)
+    }
+    throw error
+  }
   owned.sandboxes.add(sandbox)
-  await os(['sandbox', 'create', '--name', sandbox, '--provider', provider, '--detach', '--no-tty', '--', 'sleep', 'infinity'], {}, 300_000)
   for (let i = 0; i < 180; i++) {
     if ((await os(['sandbox', 'list'])).split('\n').some((l) => l.startsWith(`${sandbox} `) && /\bReady\b/.test(l))) {
       return
@@ -143,10 +164,17 @@ async function grade(w: Worker, source: string): Promise<boolean> {
       await grader.files.write(`${root}/${file}`, readFileSync(join(FIXTURE, file), 'utf8'))
     }
     await grader.files.write(`${root}/${w.source}`, source)
-    const run = await grader.commands.run(`cd ${root} && node --test ${w.test}`, { timeoutMs: 60_000 }).catch((e: unknown) => e as { exitCode?: number })
+    // A failing test is a result; a grader or transport failure is an error.
+    const run = await grader.commands.run(`cd ${root} && timeout 60 node --test ${w.test} > /tmp/grade.txt 2>&1`, { timeoutMs: 90_000 })
+      .catch((e: unknown) => {
+        if (e instanceof CommandExitError) {
+          return e
+        }
+        throw e
+      })
     return run.exitCode === 0
   } finally {
-    await grader.kill().catch(() => {})
+    await grader.kill()
     owned.graders.delete(grader)
   }
 }
@@ -154,7 +182,7 @@ async function grade(w: Worker, source: string): Promise<boolean> {
 async function work(w: Worker, provider: string): Promise<Result> {
   const sandbox = `agents-${id}-${w.n}`
   const started = Date.now()
-  const result: Result = { ...w, sandbox, seconds: 0, agentExit: null, fixed: false, testsEdited: false, diff: '', modelRequests: 0, unexpectedAllowed: [], denied: [], auditLines: 0 }
+  const result: Result = { ...w, sandbox, seconds: 0, agentExit: null, fixed: false, testsEdited: false, diff: '', modelRequests: 0, otherModelRoutes: [], unexpectedAllowed: [], denied: [], auditLines: 0 }
   try {
     log(w, `creating ${sandbox} (supervisor VM + agent VM)`)
     await createSandbox(sandbox, provider)
@@ -170,9 +198,10 @@ async function work(w: Worker, provider: string): Promise<Result> {
     writeFileSync(join(OUT, `${sandbox}-agent.txt`), out)
 
     // Collect only data; nothing the worker wrote runs on this machine.
-    const source = await sh(sandbox, `cat ${REPO}/${w.source}`)
-    const test = await sh(sandbox, `cat ${REPO}/${w.test} 2>/dev/null || true`)
-    result.testsEdited = test !== readFileSync(join(FIXTURE, w.test), 'utf8')
+    // A regular file only (no symlink), and bounded.
+    const source = await sh(sandbox, `f=${REPO}/${w.source}; [ -f "$f" ] && [ ! -L "$f" ] && [ $(stat -c %s "$f") -le ${MAX_SOURCE_BYTES} ] && cat "$f"`)
+    const tests = await sh(sandbox, `cd ${REPO} && find test -print0 | sort -z | xargs -0 stat -c '%F %n' | head -c 65536; find test -type f -print0 | sort -z | xargs -0 sha256sum | head -c 65536`)
+    result.testsEdited = tests !== testManifest
     const before = readFileSync(join(FIXTURE, w.source), 'utf8').split('\n')
     const after = source.split('\n')
     result.diff = `${w.source}: ${before.length} → ${after.length} lines`
@@ -183,7 +212,14 @@ async function work(w: Worker, provider: string): Promise<Result> {
     result.auditLines = lines.split('\n').length
     const decisions = parseAudit(lines)
     const model = PROFILES[w.agent].host
-    result.modelRequests = decisions.filter((d) => d.allowed && d.kind === 'http' && hostOf(d) === model).length
+    const route = PROFILES[w.agent].route
+    const onModel = decisions.filter((d) => d.allowed && d.kind === 'http' && hostOf(d) === model)
+    const isRoute = (d: Decision) => `${d.who} ${new URL(d.target).pathname}`.startsWith(route)
+    result.modelRequests = onModel.filter(isRoute).length
+    result.otherModelRoutes = [...new Set(onModel.filter((d) => !isRoute(d)).map((d) => `${d.who} ${new URL(d.target).pathname}`))]
+    if (result.modelRequests === 0) {
+      throw new Error(`audit inconclusive: no ${route} request recorded for ${model}`)
+    }
     result.unexpectedAllowed = [...new Set(decisions.filter((d) => d.allowed && hostOf(d) !== model).map((d) => `${d.who} ${d.target}`))]
     result.denied = [...new Set(decisions.filter((d) => !d.allowed).map((d) => `${d.who} ${hostOf(d)}`))]
     const status = result.fixed ? `${c.green}fixed${c.reset}` : `${c.red}not fixed${c.reset}`
@@ -200,13 +236,20 @@ async function work(w: Worker, provider: string): Promise<Result> {
 
 async function main() {
   mkdirSync(OUT, { recursive: true })
-  for (const key of ['E2B_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']) {
+  for (const key of ['E2B_API_KEY', 'ANTHROPIC_API_KEY']) {
     if (!process.env[key]) {
       throw new Error(`${key} is missing from .env`)
     }
   }
+  const workers = WORKERS.map((w) => {
+    if (w.agent === 'codex' && !process.env.OPENAI_API_KEY) {
+      console.log(`${c.dim}No OPENAI_API_KEY in .env: worker ${w.n} runs Claude Code instead of Codex.${c.reset}`)
+      return { ...w, agent: 'claude' as Agent }
+    }
+    return w
+  })
   const providers = {} as Record<Agent, string>
-  for (const agent of Object.keys(PROFILES) as Agent[]) {
+  for (const agent of [...new Set(workers.map((w) => w.agent))]) {
     const p = PROFILES[agent]
     await os(['provider', 'profile', 'import', '-f', p.file, '--global']).catch((e: Error) => {
       if (!/already exists/i.test(e.message)) {
@@ -220,25 +263,27 @@ async function main() {
     providers[agent] = name
   }
 
-  console.log(`${c.bold}Agent fleet ${id}: ${WORKERS.length} workers, one issue each${c.reset}\n`)
+  console.log(`${c.bold}Agent fleet ${id}: ${workers.length} workers, one issue each${c.reset}\n`)
   const started = Date.now()
-  const results = await Promise.all(WORKERS.map((w) => work(w, providers[w.agent])))
+  const results = await Promise.all(workers.map((w) => work(w, providers[w.agent])))
   const total = Math.round((Date.now() - started) / 1000)
 
   console.log(`\n${c.bold}Results${c.reset} ${c.dim}(${total}s wall clock; graded in a fresh offline sandbox)${c.reset}`)
   for (const r of results) {
-    const mark = r.fixed && !r.error ? `${c.green}✓${c.reset}` : `${c.red}✗${c.reset}`
+    const mark = r.fixed && r.agentExit === 0 && !r.error ? `${c.green}✓${c.reset}` : `${c.red}✗${c.reset}`
     console.log(`  ${mark} [${r.n}] ${r.agent.padEnd(6)} ${r.issue.padEnd(11)} ${String(r.seconds).padStart(3)}s  ${r.diff}${r.testsEdited ? `  ${c.red}(edited the tests; graded with the originals)${c.reset}` : ''}`)
   }
   console.log(`\n${c.magenta}${c.bold}OpenShell${c.reset}`)
   for (const r of results) {
+    // Full list in the JSON report; for Claude Code these are settings, metrics and event logging.
+    const routes = r.otherModelRoutes.length ? ` ${c.dim}+ ${r.otherModelRoutes.length} other API routes with the key${c.reset}` : ''
     const extra = r.unexpectedAllowed.length ? ` · ${c.red}also allowed: ${r.unexpectedAllowed.join(', ')}${c.reset}` : ''
     const denied = r.denied.length ? r.denied.join(', ') : 'none'
-    console.log(`  [${r.n}] ${r.agent.padEnd(6)} ${r.modelRequests} requests to ${PROFILES[r.agent].host}, key added outside the VM${extra} · ${c.dim}denied: ${denied}${c.reset}`)
+    console.log(`  [${r.n}] ${r.agent.padEnd(6)} ${r.modelRequests} requests to ${PROFILES[r.agent].host}, key added outside the VM${routes}${extra} · ${c.dim}denied: ${denied}${c.reset}`)
   }
   writeFileSync(join(OUT, `agents-${id}.json`), `${JSON.stringify({ id, total, results }, null, 2)}\n`)
   console.log(`\nReport: ${OUT}/agents-${id}.json`)
-  if (!results.every((r) => r.fixed && !r.error && r.unexpectedAllowed.length === 0)) {
+  if (!results.every((r) => r.fixed && r.agentExit === 0 && !r.error && r.unexpectedAllowed.length === 0)) {
     process.exitCode = 1
   }
 }
@@ -247,12 +292,12 @@ async function main() {
 let cleaning: Promise<void> | undefined
 function cleanup(): Promise<void> {
   cleaning ??= (async () => {
-    await Promise.all([...owned.graders].map((g) => g.kill().catch(() => {})))
+    const left: string[] = []
+    await Promise.all([...owned.graders].map((g) => g.kill().then(() => owned.graders.delete(g)).catch(() => left.push(`grader ${g.sandboxId}`))))
     if (keep) {
       console.log(`Kept: ${[...owned.sandboxes].join(', ')}`)
       return
     }
-    const left: string[] = []
     const remove = async (args: string[], label: string) => {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
