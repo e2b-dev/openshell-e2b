@@ -152,6 +152,35 @@ Template notes (`templates/workload-openclaw.ts`):
 
 The driver reads `OPENSHELL_WORKLOAD_TEMPLATE` when it starts. If a gateway is already connected with the default template, stop it before you run the OpenClaw demo.
 
+## Coding-agent fleet: Claude Code and Codex under OpenShell
+
+A manager on your laptop starts three coding agents in parallel, one bug each, in their own OpenShell sandboxes: two Claude Code workers and one Codex worker. Each worker is a supervisor VM and an agent VM.
+
+```bash
+npm run template:workload:agents   # once: E2B's claude template + Codex 0.169.0 (pinned, SHA-256 verified)
+OPENSHELL_WORKLOAD_TEMPLATE=openshell-workload-agents npm run connect   # terminal 1
+npm run agents                     # terminal 2: 3 workers, graded, then cleanup
+npm run demo:record:agents         # live run → media/agents-demo.mp4 (+ 720p copy)
+```
+
+`.env` needs `E2B_API_KEY`, `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. Without the OpenAI key, worker 3 runs Claude Code too.
+
+What the run shows:
+
+- **Keys stay outside.** Each worker gets one provider (`providers/fleet-claude-code.yaml` or `providers/fleet-codex.yaml`). Inside the VM the key is an `openshell:resolve:…` placeholder. Supervisor A adds the real key only to requests to that agent's API host from that agent's binary.
+- **Nothing else is reachable.** No rule allows any other host. A live run on 2026-11-27 recorded these denials: Claude Code's Datadog telemetry and updater, and Codex's calls to `github.com`, `api.github.com` and `chatgpt.com`.
+- **The key reaches more than inference.** Besides `POST /v1/messages`, Claude Code used its key on about ten other `api.anthropic.com` routes (settings, metrics, event logging). The run lists them, because the provider grants the whole host.
+- **The manager does not trust the agents.** Only the assigned source file leaves the worker, as a regular file of at most 256 KiB. The original test runs against it in a fresh E2B sandbox with no internet and no keys. Changes to `test/` are reported.
+
+`fixtures/fleet-repo` is a tiny library with three real bugs and failing tests. Each run writes `dist/agents/agents-<id>.json` with each agent's exit status, the grade, the requests on the model host and every denial. `dist/agents/live/<n>.log` has one line per agent step; the video shows those logs.
+
+Notes on Codex under OpenShell:
+
+- OpenShell sets the placeholder only under the variable the key came from (`OPENAI_API_KEY`), and Codex does not read that variable without a login. `scripts/agents.ts` gives Codex a model provider with `env_key = "OPENAI_API_KEY"` instead.
+- That provider sets `supports_websockets = false`. OpenShell's REST rule refuses the WebSocket upgrade Codex tries first.
+- Codex runs its shell tool through `codex-code-mode-host`, a separate release binary. The template installs it next to `codex`.
+- Codex runs with `--dangerously-bypass-approvals-and-sandbox`, because OpenShell is the sandbox.
+
 ## Build and test
 
 ```bash
