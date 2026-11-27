@@ -19,13 +19,16 @@
     "typecheck": "tsc --noEmit",
     "demo:down": "tsx --env-file=.env scripts/demo-down.ts",
     "openclaw": "tsx --env-file=.env scripts/openclaw-demo.ts",
+    "agents": "tsx --env-file=.env scripts/agents.ts",
+    "demo:record:agents": "bash scripts/agents-record.sh",
     "demo:record:openclaw": "bash scripts/openclaw-record.sh",
     "studio": "tsx --env-file=.env scripts/studio.ts",
     "demo:studio": "bash scripts/studio.sh",
     "demo:record": "bash scripts/studio.sh --record",
     "demo:dashboard": "bash scripts/dashboard.sh",
     "demo:record:dashboard": "bash scripts/dashboard.sh --record",
-    "template:workload:openclaw": "tsx --env-file=.env templates/workload-openclaw.ts"
+    "template:workload:openclaw": "tsx --env-file=.env templates/workload-openclaw.ts",
+    "template:workload:agents": "tsx --env-file=.env templates/workload-agents.ts"
   },
   "dependencies": {
     "e2b": "^2.51.0",
