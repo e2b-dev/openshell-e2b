@@ -455,6 +455,7 @@ function cleanup(): Promise<void> {
     } else {
       console.log(`${c.dim}Workers, graders and providers deleted.${c.reset}`)
     }
+    mark('cleaned')
   })()
   return cleaning
 }
