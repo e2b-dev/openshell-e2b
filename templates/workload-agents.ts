@@ -17,6 +17,8 @@ const CODE_MODE_HOST_SHA256 = 'cbed6a8d25e8268792b757767fbc76d4c62e84bcf8ee4a63f
 const RELEASE = `https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}`
 
 export const template = withOpenShellWorker(Template({ fileContextPath: process.cwd() }).fromTemplate('claude'))
+  // ripgrep: Codex searches with rg first.
+  .aptInstall(['ripgrep'])
   .runCmd([
     'set -eu',
     `curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/codex.tar.gz ${RELEASE}/codex-x86_64-unknown-linux-musl.tar.gz`,

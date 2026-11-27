@@ -17,7 +17,7 @@
 // and E2B_API_KEY, ANTHROPIC_API_KEY and OPENAI_API_KEY (for the Codex worker) in .env.
 import { randomBytes } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { CommandExitError, Sandbox } from 'e2b'
 
@@ -83,6 +83,118 @@ const tag = (w: Worker) => `${c.dim}[${w.n}]${c.reset} ${w.agent === 'claude' ? 
 const log = (w: Worker, text: string) => console.log(`${tag(w)} ${text}`)
 const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 
+// Live view: one log per worker (dist/agents/live/<n>.log), for `tail -f` in the video,
+// and wall-clock marks (AGENTS_MARKS) so the editor knows where the waits are.
+const LIVE = join(OUT, 'live')
+const live = (w: Worker, text: string) => appendFileSync(join(LIVE, `${w.n}.log`), `${text}\n`)
+const mark = (event: string) => {
+  if (process.env.AGENTS_MARKS) {
+    appendFileSync(process.env.AGENTS_MARKS, `${JSON.stringify({ event, t: Date.now() / 1000 })}\n`)
+  }
+}
+const short = (text: string, max = 58) => (text.length > max ? `${text.slice(0, max - 1)}…` : text)
+
+// Claude Code's stream-json events and Codex's console output, reduced to one line per step.
+function stepper(agent: Agent): (line: string) => string | undefined {
+  if (agent === 'claude') {
+    return (line) => {
+      let event: { type?: string; message?: { content?: { type: string; name?: string; input?: Record<string, unknown>; text?: string }[] }; num_turns?: number }
+      try {
+        event = JSON.parse(line)
+      } catch {
+        return undefined
+      }
+      if (event.type === 'assistant') {
+        const parts = (event.message?.content ?? []).map((part) => {
+          if (part.type === 'tool_use') {
+            const input = part.input ?? {}
+            const arg = String(input.command ?? input.file_path ?? input.pattern ?? input.path ?? '').replace(/^\/sandbox\/fleet-repo\//, '')
+            return `${c.yellow}▸ ${part.name}${c.reset} ${short(arg)}`
+          }
+          if (part.type === 'text' && part.text?.trim()) {
+            return `${c.dim}${short(part.text.trim().split('\n')[0], 64)}${c.reset}`
+          }
+          return ''
+        }).filter(Boolean)
+        return parts.join('\n') || undefined
+      }
+      if (event.type === 'result') {
+        return `${c.dim}done in ${event.num_turns ?? '?'} turns${c.reset}`
+      }
+      return undefined
+    }
+  }
+  // Codex prints blocks: "codex" (a message), "exec" (a command, then its output),
+  // "apply patch" (an edit). The prompt echo comes first, the final answer after "tokens used".
+  let state: 'prompt' | 'message' | 'command' | 'patch' | 'output' | 'end' = 'prompt'
+  return (raw) => {
+    const line = raw.trimEnd()
+    if (/^\d{4}-\d\d-\d\dT|^warning:/.test(line)) {
+      return undefined
+    }
+    if (line === 'codex') {
+      state = state === 'end' ? 'end' : 'message'
+      return undefined
+    }
+    if (line === 'exec') {
+      state = 'command'
+      return undefined
+    }
+    if (line === 'apply patch') {
+      state = 'patch'
+      return undefined
+    }
+    if (line === 'tokens used') {
+      state = 'end'
+      return `${c.dim}done${c.reset}`
+    }
+    if (!line.trim()) {
+      return undefined
+    }
+    if (state === 'message') {
+      return `${c.dim}${short(line, 64)}${c.reset}`
+    }
+    if (state === 'command') {
+      state = 'output'
+      const cmd = line.replace(/^\/bin\/(bash|sh) -lc /, '').replace(/ in \/sandbox\/fleet-repo$/, '').replace(/^["']|["']$/g, '')
+      return `${c.blue}▸ exec${c.reset} ${short(cmd)}`
+    }
+    if (state === 'patch' && line.startsWith('/sandbox/fleet-repo/')) {
+      state = 'output'
+      return `${c.blue}▸ edit${c.reset} ${line.replace('/sandbox/fleet-repo/', '')}`
+    }
+    return undefined
+  }
+}
+
+// Like os(), but hands each stdout line to onLine as it arrives.
+function osStream(args: string[], onLine: (line: string) => void, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('.bin/openshell', args, { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs })
+    const chunks: Buffer[] = []
+    let pending = Buffer.alloc(0)
+    child.stdout.on('data', (d: Buffer) => {
+      chunks.push(d)
+      pending = Buffer.concat([pending, d])
+      let nl = pending.indexOf(10)
+      while (nl >= 0) {
+        onLine(pending.subarray(0, nl).toString('utf8'))
+        pending = pending.subarray(nl + 1)
+        nl = pending.indexOf(10)
+      }
+    })
+    child.stderr.on('data', () => {})
+    child.on('error', reject)
+    child.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks).toString('utf8'))
+      } else {
+        reject(new Error(`openshell sandbox exec: ${signal ? `killed (${signal})` : `exit ${code}`}`))
+      }
+    })
+  })
+}
+
 // --- audit -------------------------------------------------------------------------
 
 type Decision = { allowed: boolean; kind: 'http' | 'connect'; who: string; target: string }
@@ -144,7 +256,7 @@ async function createSandbox(sandbox: string, provider: string) {
 function agentCommand(agent: Agent, issue: string) {
   const task = `Fix the issue below in src/. Run its test to check your fix. Do not change the tests.\n\n$(cat issues/${issue}.md)`
   if (agent === 'claude') {
-    return `claude -p "${task}" --model ${CLAUDE_MODEL} --dangerously-skip-permissions --output-format text`
+    return `claude -p "${task}" --model ${CLAUDE_MODEL} --dangerously-skip-permissions --output-format stream-json --verbose`
   }
   // OpenShell is the sandbox here, so Codex's own sandbox and approvals are off.
   // The provider reads the placeholder from OPENAI_API_KEY (no login) and uses plain
@@ -185,17 +297,32 @@ async function work(w: Worker, provider: string): Promise<Result> {
   const result: Result = { ...w, sandbox, seconds: 0, agentExit: null, fixed: false, testsEdited: false, diff: '', modelRequests: 0, otherModelRoutes: [], unexpectedAllowed: [], denied: [], auditLines: 0 }
   try {
     log(w, `creating ${sandbox} (supervisor VM + agent VM)`)
+    live(w, `${c.bold}${w.agent === 'claude' ? 'Claude Code' : 'Codex'}${c.reset} · issues/${w.issue}.md`)
+    live(w, `${c.dim}creating a supervisor VM + agent VM…${c.reset}`)
     await createSandbox(sandbox, provider)
     await os(['sandbox', 'upload', sandbox, FIXTURE, '/sandbox'])
+    // A baseline commit, so the agent can use git status and git diff as usual.
+    await sh(sandbox, `cd ${REPO} && git init -q && git add -A && git -c user.email=fleet@fleet.example -c user.name=fleet commit -qm baseline`)
     const placeholder = (await sh(sandbox, `case "$${PROFILES[w.agent].key}" in openshell:resolve:*) echo yes;; *) echo no;; esac`)).trim() === 'yes'
     if (!placeholder) {
       throw new Error(`${PROFILES[w.agent].key} in the VM is not an OpenShell placeholder`)
     }
     log(w, `ready · ${PROFILES[w.agent].key} in the VM is a placeholder · working on ${c.bold}issues/${w.issue}.md${c.reset}`)
-    const out = await sh(sandbox, `cd ${REPO} && timeout ${AGENT_SECONDS} ${agentCommand(w.agent, w.issue)} > /tmp/agent.txt 2>&1; echo "AGENT_EXIT=$?"; tail -n 40 /tmp/agent.txt`, (AGENT_SECONDS + 60) * 1000)
+    live(w, `${c.green}●${c.reset} ready · ${PROFILES[w.agent].key} = ${c.dim}openshell:resolve:…${c.reset}`)
+    mark(`ready_${w.n}`)
+    const format = stepper(w.agent)
+    const out = await osStream(['sandbox', 'exec', '-n', sandbox, '--no-tty', '--', 'sh', '-c',
+      `cd ${REPO} && timeout ${AGENT_SECONDS} ${agentCommand(w.agent, w.issue)} 2>&1; echo "AGENT_EXIT=$?"`],
+    (line) => {
+      const text = format(line)
+      if (text) {
+        live(w, text)
+      }
+    }, (AGENT_SECONDS + 60) * 1000)
+    mark(`done_${w.n}`)
     const exit = Number(/AGENT_EXIT=(\d+)/.exec(out)?.[1] ?? -1)
     result.agentExit = exit === 124 ? 'timeout' : exit
-    writeFileSync(join(OUT, `${sandbox}-agent.txt`), out)
+    writeFileSync(join(OUT, `${sandbox}-agent.txt`), out.slice(-200_000))
 
     // Collect only data; nothing the worker wrote runs on this machine.
     // A regular file only (no symlink), and bounded.
@@ -223,6 +350,7 @@ async function work(w: Worker, provider: string): Promise<Result> {
     result.unexpectedAllowed = [...new Set(decisions.filter((d) => d.allowed && hostOf(d) !== model).map((d) => `${d.who} ${d.target}`))]
     result.denied = [...new Set(decisions.filter((d) => !d.allowed).map((d) => `${d.who} ${hostOf(d)}`))]
     const status = result.fixed ? `${c.green}fixed${c.reset}` : `${c.red}not fixed${c.reset}`
+    live(w, result.fixed ? `${c.green}✓ fixed${c.reset} ${c.dim}(original test, offline grader)${c.reset}` : `${c.red}✗ not fixed${c.reset}`)
     log(w, `${status} · agent exit ${result.agentExit} · ${result.modelRequests} model requests${result.denied.length ? ` · ${c.red}${result.denied.length} denied${c.reset}` : ''}`)
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error)
@@ -236,6 +364,12 @@ async function work(w: Worker, provider: string): Promise<Result> {
 
 async function main() {
   mkdirSync(OUT, { recursive: true })
+  rmSync(LIVE, { recursive: true, force: true })
+  mkdirSync(LIVE, { recursive: true })
+  for (const w of WORKERS) {
+    writeFileSync(join(LIVE, `${w.n}.log`), '')
+  }
+  mark('run_start')
   for (const key of ['E2B_API_KEY', 'ANTHROPIC_API_KEY']) {
     if (!process.env[key]) {
       throw new Error(`${key} is missing from .env`)
@@ -267,6 +401,7 @@ async function main() {
   const started = Date.now()
   const results = await Promise.all(workers.map((w) => work(w, providers[w.agent])))
   const total = Math.round((Date.now() - started) / 1000)
+  mark('results')
 
   console.log(`\n${c.bold}Results${c.reset} ${c.dim}(${total}s wall clock; graded in a fresh offline sandbox)${c.reset}`)
   for (const r of results) {
