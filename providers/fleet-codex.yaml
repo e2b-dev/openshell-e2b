@@ -1,8 +1,10 @@
 # Provider profile for Codex with an OpenAI API key, in the openshell-workload-agents
 # template. Based on OpenShell's providers/openai.yaml (Apache-2.0). Changes: the id,
-# and the binary: only the Codex CLI at /usr/bin/codex may use the key. Codex reads
-# CODEX_API_KEY in `codex exec`, so the placeholder is set under both names.
+# and the binary: only the Codex CLI at /usr/bin/codex may use the key. scripts/fleet.ts
+# points Codex at OPENAI_API_KEY with a model provider (env_key), so no login is needed.
 # (OpenShell's providers/codex.yaml is for ChatGPT sign-in tokens instead.)
+# Scope: the binary below and the processes it starts may send the key to the whole
+# API host (read-write), not only the inference route. Use a project-scoped key.
 #   openshell provider profile import -f providers/fleet-codex.yaml --global
 id: fleet-codex
 display_name: Codex (fleet)
@@ -12,7 +14,7 @@ inference_capable: true
 credentials:
   - name: api_key
     description: OpenAI API key used by Codex
-    env_vars: [CODEX_API_KEY, OPENAI_API_KEY]
+    env_vars: [OPENAI_API_KEY]
     required: true
     auth_style: bearer
     header_name: authorization

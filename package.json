@@ -19,7 +19,7 @@
     "typecheck": "tsc --noEmit",
     "demo:down": "tsx --env-file=.env scripts/demo-down.ts",
     "openclaw": "tsx --env-file=.env scripts/openclaw-demo.ts",
-    "fleet": "tsx --env-file=.env scripts/fleet.ts",
+    "agents": "tsx --env-file=.env scripts/agents.ts",
     "demo:record:openclaw": "bash scripts/openclaw-record.sh",
     "studio": "tsx --env-file=.env scripts/studio.ts",
     "demo:studio": "bash scripts/studio.sh",
